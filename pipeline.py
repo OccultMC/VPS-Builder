@@ -842,32 +842,32 @@ class _LogTee:
                 pass
 
 
-def main():
-    WORK_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = WORK_DIR / "builder.log"
-    tee = _LogTee(log_path)
-    tee.start()
+def _clean_work_dir():
+    """Delete all files in WORK_DIR to free disk for the next city."""
+    import shutil
+    for child in WORK_DIR.iterdir():
+        try:
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        except Exception as e:
+            print(f"  [WARN] Could not delete {child}: {e}")
 
-    print("=" * 80)
-    print("  VPS BUILDER PIPELINE — Feature Merge + FAISS Index")
-    print("=" * 80)
 
-    # Environment
-    features_prefix = get_env("FEATURES_BUCKET_PREFIX")
-    city_name = get_env("CITY_NAME")
-
-    print(f"Features prefix: {features_prefix}")
-    print(f"City: {city_name}")
-    print(f"Work dir: {WORK_DIR}")
-    print(f"CPU cores: {os.cpu_count()} (OMP_NUM_THREADS={_ncpu})")
-
-    # Init R2 and detect instance ID
-    r2 = R2Client()
-    instance_id = _detect_instance_id(r2, city_name)
-    print(f"Instance ID: {instance_id or '(unknown)'}")
+def _build_one_city(r2: R2Client, features_prefix: str, city_name: str,
+                    instance_id: str, city_idx: int, total_cities: int):
+    """Build index for a single city. Returns True on success."""
+    tag = f"[{city_idx}/{total_cities}]"
+    print(f"\n{'='*80}")
+    print(f"  {tag} BUILDING INDEX: {city_name}")
+    print(f"  Features: {features_prefix}")
+    print(f"{'='*80}")
 
     reporter = StatusReporter(r2, city_name, instance_id)
-    reporter.report("init", "Starting builder pipeline", 0)
+    # Update status key to use batch-aware format
+    reporter.status_key = f"Status/INDEX_{instance_id}.json"
+    reporter.report("init", f"{tag} Starting {city_name}", 0)
 
     try:
         # Step 1: Discover files
@@ -887,33 +887,114 @@ def main():
         # Step 5: Upload
         upload_results(r2, features_prefix, reporter)
 
-        reporter.report_final("COMPLETED", f"Index built with {total_vectors:,} vectors")
-        print("\n" + "=" * 80)
-        print("  DONE! Index built and uploaded successfully.")
-        print("=" * 80)
+        reporter.report("done", f"{tag} {city_name}: {total_vectors:,} vectors", 100,
+                        "CITY_DONE")
+        print(f"\n  {tag} DONE — {city_name}: {total_vectors:,} vectors")
+        return True
 
     except Exception as e:
-        reporter.report_final("FAILED", str(e))
-        print(f"\n[FATAL] Pipeline failed: {e}")
+        reporter.report("done", f"{tag} {city_name} FAILED: {e}", 0, "CITY_FAILED")
+        print(f"\n  {tag} FAILED — {city_name}: {e}")
         import traceback
         traceback.print_exc()
+        return False
 
-        tee.stop()
-        print("[INFO] Container kept alive for debugging. SSH in to investigate.")
-        sys.stdout.flush()
-        import signal
-        signal.pause()
-        return
+    finally:
+        # Clean up work dir for next city
+        print(f"  {tag} Cleaning work dir for next city...")
+        _clean_work_dir()
+        WORK_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def main():
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = WORK_DIR / "builder.log"
+    tee = _LogTee(log_path)
+    tee.start()
+
+    print("=" * 80)
+    print("  VPS BUILDER PIPELINE — Feature Merge + FAISS Index")
+    print("=" * 80)
+
+    # Init R2 and detect instance ID
+    r2 = R2Client()
+
+    # ── Batch mode: BATCH_CITIES env var (JSON list) ──
+    batch_raw = os.environ.get("BATCH_CITIES", "")
+    if batch_raw:
+        try:
+            cities = json.loads(batch_raw)
+        except json.JSONDecodeError as e:
+            print(f"[FATAL] Invalid BATCH_CITIES JSON: {e}")
+            sys.exit(1)
+    else:
+        # Single-city fallback (legacy)
+        cities = [{
+            "features_prefix": get_env("FEATURES_BUCKET_PREFIX"),
+            "city_name": get_env("CITY_NAME"),
+        }]
+
+    # Detect instance ID using first city
+    first_city = cities[0]["city_name"]
+    instance_id = _detect_instance_id(r2, first_city)
+    print(f"Instance ID: {instance_id or '(unknown)'}")
+    print(f"Work dir: {WORK_DIR}")
+    print(f"CPU cores: {os.cpu_count()} (OMP_NUM_THREADS={_ncpu})")
+    print(f"Cities to build: {len(cities)}")
+    for i, c in enumerate(cities, 1):
+        print(f"  {i}. {c['city_name']} — {c['features_prefix']}")
+
+    # Write batch status so monitor knows what's happening
+    batch_reporter = StatusReporter(r2, first_city, instance_id)
+    batch_reporter.status_key = f"Status/INDEX_{instance_id}.json"
+    batch_reporter.report("init", f"Batch: {len(cities)} cities", 0)
+
+    succeeded = []
+    failed = []
+
+    for i, city_info in enumerate(cities, 1):
+        fp = city_info["features_prefix"]
+        cn = city_info["city_name"]
+
+        ok = _build_one_city(r2, fp, cn, instance_id, i, len(cities))
+        if ok:
+            succeeded.append(cn)
+        else:
+            failed.append(cn)
+
+    # Final batch status
+    summary = f"{len(succeeded)}/{len(cities)} cities built"
+    if failed:
+        summary += f" (failed: {', '.join(failed)})"
+
+    if failed and not succeeded:
+        batch_reporter.report("done", summary, 100, "FAILED")
+    else:
+        batch_reporter.report("done", summary, 100, "COMPLETED")
+
+    print(f"\n{'='*80}")
+    print(f"  BATCH COMPLETE — {summary}")
+    print(f"{'='*80}")
 
     tee.stop()
 
-    # Wait for monitor to pick up COMPLETED, then clean up
-    print("[INFO] Waiting 30s for monitor to see COMPLETED status...")
+    # Wait for monitor to pick up status, then clean up
+    print("[INFO] Waiting 30s for monitor to see final status...")
     time.sleep(30)
-    _cleanup_status(r2, city_name, instance_id)
 
-    # Step 6: Self-destruct
-    self_destruct(r2, city_name, instance_id)
+    # Clean up status files
+    for key in [
+        f"Status/INDEX_{instance_id}.json",
+        f"Status/INDEX_{first_city}_lookup.json",
+    ]:
+        try:
+            r2.delete_file(key)
+            print(f"[CLEANUP] Deleted {key}")
+        except Exception:
+            pass
+
+    # Self-destruct
+    self_destruct(r2, first_city, instance_id)
 
 
 if __name__ == "__main__":
