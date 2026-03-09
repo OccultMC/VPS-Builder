@@ -919,14 +919,20 @@ def main():
     # Init R2 and detect instance ID
     r2 = R2Client()
 
-    # ── Batch mode: BATCH_CITIES env var (JSON list) ──
+    # ── Batch mode: BATCH_CITIES env var (base64-encoded JSON list) ──
     batch_raw = os.environ.get("BATCH_CITIES", "")
     if batch_raw:
         try:
-            cities = json.loads(batch_raw)
-        except json.JSONDecodeError as e:
-            print(f"[FATAL] Invalid BATCH_CITIES JSON: {e}")
-            sys.exit(1)
+            import base64
+            decoded = base64.b64decode(batch_raw).decode()
+            cities = json.loads(decoded)
+        except Exception as e:
+            # Fallback: try plain JSON (for manual/testing use)
+            try:
+                cities = json.loads(batch_raw)
+            except json.JSONDecodeError as e2:
+                print(f"[FATAL] Invalid BATCH_CITIES (tried base64 and plain JSON): {e2}")
+                sys.exit(1)
     else:
         # Single-city fallback (legacy)
         cities = [{
