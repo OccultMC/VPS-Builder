@@ -598,16 +598,8 @@ def build_faiss_index(features_path: Path, n_vectors: int,
     # Enable FAISS verbose output for training progress
     index.verbose = True
 
-    # Training — cap samples to avoid OOM/segfault on large datasets
-    # PQ only needs ~100K-200K samples for stable codebook training
-    MAX_TRAIN = 200_000
-    train_samples = min(n_vectors, TRAIN_SAMPLES, MAX_TRAIN)
-
-    # Extra safety: cap based on memory (keep training data under 4 GB)
-    max_by_mem = (4 * 1024**3) // (FEATURE_DIM * 4)  # 4 GB / (dim * sizeof(float32))
-    if train_samples > max_by_mem:
-        train_samples = int(max_by_mem)
-        print(f"  Capped training samples to {train_samples:,} (4 GB memory limit)")
+    # Training — use 33% of vectors, capped at TRAIN_SAMPLES (default 1M)
+    train_samples = min(n_vectors // 3 or n_vectors, TRAIN_SAMPLES)
 
     print(f"\nSampling {train_samples:,} vectors for training...")
     reporter.report("index", f"Sampling {train_samples:,} training vectors", 5)
