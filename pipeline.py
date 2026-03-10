@@ -971,7 +971,12 @@ def _run_redis_queue(r2: R2Client, instance_id: str):
         prog = bq.get_progress(build_job)
         total_cities = prog["total_cities"]
 
+        # Heartbeat thread keeps our active claim alive during long builds
+        hb = bq.heartbeat_loop(build_job, worker_id, city_id)
+        hb.start()
         ok = _build_one_city(r2, fp, cn, instance_id, total_done, total_cities)
+        hb.stop()
+
         if ok:
             bq.complete_city(build_job, city_id, worker_id)
             succeeded.append(cn)

@@ -15,13 +15,44 @@ Redis key schema:
 """
 import time
 import logging
+import threading
 from typing import List, Dict, Optional
 
 from upstash_redis import Redis
 
 logger = logging.getLogger(__name__)
 
-STALE_TIMEOUT = 600  # 10 minutes — index builds are slow
+HEARTBEAT_INTERVAL = 120  # 2 minutes between heartbeats
+STALE_TIMEOUT = 600       # 10 minutes without heartbeat = dead worker
+
+
+class _HeartbeatThread:
+    """Background thread that pings Redis every HEARTBEAT_INTERVAL seconds."""
+
+    def __init__(self, bq, job, worker_id, city_id):
+        self._bq = bq
+        self._job = job
+        self._worker_id = worker_id
+        self._city_id = city_id
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def _run(self):
+        while not self._stop.wait(HEARTBEAT_INTERVAL):
+            try:
+                self._bq.heartbeat(self._job, self._worker_id, self._city_id)
+            except Exception as e:
+                logger.warning(f"Heartbeat failed: {e}")
 
 
 class BuildQueue:
@@ -137,6 +168,17 @@ class BuildQueue:
         self.redis.hset(
             self._active_key(job), city_id, f"{worker_id}|{time.time()}"
         )
+
+    def heartbeat_loop(self, job: str, worker_id: str, city_id: str):
+        """Return a HeartbeatThread that pings Redis every 2 min while building.
+
+        Usage:
+            hb = bq.heartbeat_loop(job, worker_id, city_id)
+            hb.start()
+            ... do work ...
+            hb.stop()
+        """
+        return _HeartbeatThread(self, job, worker_id, city_id)
 
     # ── Stale recovery ────────────────────────────────────────────────────
 
