@@ -5,6 +5,13 @@ echo "=== Hypervision VPS Builder ==="
 echo "City: ${CITY_NAME}"
 echo "Features Prefix: ${FEATURES_BUCKET_PREFIX}"
 echo "Instance: ${INSTANCE_ID}"
+if [ -n "${BUILD_JOB}" ]; then
+    echo "Mode: Redis queue (job: ${BUILD_JOB})"
+elif [ -n "${BATCH_CITIES}" ]; then
+    echo "Mode: Batch (BATCH_CITIES set)"
+else
+    echo "Mode: Single city"
+fi
 echo "CPU: $(nproc) cores"
 echo "RAM: $(free -h | awk '/^Mem:/{print $2}') total, $(free -h | awk '/^Mem:/{print $7}') available"
 echo "Disk: $(df -h / | tail -1 | awk '{print $4}') free"

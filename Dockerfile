@@ -17,7 +17,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Application code
-COPY pipeline.py r2_storage.py entrypoint.sh ./
+COPY pipeline.py r2_storage.py redis_queue.py entrypoint.sh ./
 
 RUN dos2unix entrypoint.sh && chmod +x entrypoint.sh
 

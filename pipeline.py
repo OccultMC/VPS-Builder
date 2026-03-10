@@ -923,52 +923,105 @@ def _build_one_city(r2: R2Client, features_prefix: str, city_name: str,
         WORK_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def main():
-    WORK_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = WORK_DIR / "builder.log"
-    tee = _LogTee(log_path)
-    tee.start()
+def _run_redis_queue(r2: R2Client, instance_id: str):
+    """Redis queue mode: claim cities one at a time until queue is empty."""
+    from redis_queue import BuildQueue
 
-    print("=" * 80)
-    print("  VPS BUILDER PIPELINE — Feature Merge + FAISS Index")
-    print("=" * 80)
+    redis_url = os.environ["REDIS_URL"]
+    redis_token = os.environ["REDIS_TOKEN"]
+    build_job = os.environ["BUILD_JOB"]
 
-    # Init R2 and detect instance ID
-    r2 = R2Client()
+    bq = BuildQueue(redis_url, redis_token)
 
-    # ── Batch mode: BATCH_CITIES env var (base64-encoded JSON list) ──
+    print(f"Redis queue mode — job: {build_job}")
+    progress = bq.get_progress(build_job)
+    print(f"  Total cities: {progress['total_cities']}, "
+          f"todo: {progress['todo']}, active: {progress['active']}, "
+          f"done: {progress['done']}, failed: {progress['failed']}")
+
+    worker_id = instance_id or f"worker_{int(time.time())}"
+    succeeded = []
+    failed = []
+
+    # Reclaim any stale tasks from crashed workers before starting
+    reclaimed = bq.reclaim_stale(build_job)
+    if reclaimed:
+        print(f"  Reclaimed {len(reclaimed)} stale cities: {reclaimed}")
+
+    batch_reporter = StatusReporter(r2, "queue", instance_id)
+    batch_reporter.status_key = f"Status/INDEX_{instance_id}.json"
+
+    while True:
+        city = bq.claim_city(build_job, worker_id)
+        if city is None:
+            print("\n[QUEUE] No more cities — queue empty")
+            break
+
+        city_id = city["city_id"]
+        fp = city["features_prefix"]
+        cn = city["city_name"]
+        total_done = len(succeeded) + len(failed) + 1
+
+        print(f"\n[QUEUE] Claimed {city_id}: {cn} ({fp})")
+        bq.report_worker(build_job, worker_id, "BUILDING",
+                         city_id=city_id, cities_done=len(succeeded),
+                         current_city=cn)
+
+        # Use progress for total count display
+        prog = bq.get_progress(build_job)
+        total_cities = prog["total_cities"]
+
+        ok = _build_one_city(r2, fp, cn, instance_id, total_done, total_cities)
+        if ok:
+            bq.complete_city(build_job, city_id, worker_id)
+            succeeded.append(cn)
+        else:
+            bq.fail_city(build_job, city_id, worker_id, f"{cn} build failed")
+            failed.append(cn)
+
+        # Heartbeat / worker status update
+        bq.report_worker(build_job, worker_id, "IDLE",
+                         city_id=city_id, cities_done=len(succeeded),
+                         current_city="")
+
+    # Final summary
+    summary = f"Worker {worker_id}: {len(succeeded)} built, {len(failed)} failed"
+    bq.report_worker(build_job, worker_id, "DONE",
+                     cities_done=len(succeeded), current_city="")
+
+    batch_reporter.report("done", summary, 100, "COMPLETED")
+    print(f"\n{'='*80}")
+    print(f"  {summary}")
+    print(f"{'='*80}")
+
+    return succeeded, failed
+
+
+def _run_batch(r2: R2Client, instance_id: str):
+    """Batch mode: BATCH_CITIES env var or single-city fallback."""
     batch_raw = os.environ.get("BATCH_CITIES", "")
     if batch_raw:
         try:
             import base64
             decoded = base64.b64decode(batch_raw).decode()
             cities = json.loads(decoded)
-        except Exception as e:
-            # Fallback: try plain JSON (for manual/testing use)
+        except Exception:
             try:
                 cities = json.loads(batch_raw)
             except json.JSONDecodeError as e2:
                 print(f"[FATAL] Invalid BATCH_CITIES (tried base64 and plain JSON): {e2}")
                 sys.exit(1)
     else:
-        # Single-city fallback (legacy)
         cities = [{
             "features_prefix": get_env("FEATURES_BUCKET_PREFIX"),
             "city_name": get_env("CITY_NAME"),
         }]
 
-    # Detect instance ID using first city
-    first_city = cities[0]["city_name"]
-    instance_id = _detect_instance_id(r2, first_city)
-    print(f"Instance ID: {instance_id or '(unknown)'}")
-    print(f"Work dir: {WORK_DIR}")
-    print(f"CPU cores: {os.cpu_count()} (OMP_NUM_THREADS={_ncpu})")
-    print(f"Cities to build: {len(cities)}")
+    print(f"Batch mode — {len(cities)} cities")
     for i, c in enumerate(cities, 1):
         print(f"  {i}. {c['city_name']} — {c['features_prefix']}")
 
-    # Write batch status so monitor knows what's happening
-    batch_reporter = StatusReporter(r2, first_city, instance_id)
+    batch_reporter = StatusReporter(r2, cities[0]["city_name"], instance_id)
     batch_reporter.status_key = f"Status/INDEX_{instance_id}.json"
     batch_reporter.report("init", f"Batch: {len(cities)} cities", 0)
 
@@ -976,16 +1029,14 @@ def main():
     failed = []
 
     for i, city_info in enumerate(cities, 1):
-        fp = city_info["features_prefix"]
-        cn = city_info["city_name"]
-
-        ok = _build_one_city(r2, fp, cn, instance_id, i, len(cities))
+        ok = _build_one_city(r2, city_info["features_prefix"],
+                             city_info["city_name"], instance_id,
+                             i, len(cities))
         if ok:
-            succeeded.append(cn)
+            succeeded.append(city_info["city_name"])
         else:
-            failed.append(cn)
+            failed.append(city_info["city_name"])
 
-    # Final batch status
     summary = f"{len(succeeded)}/{len(cities)} cities built"
     if failed:
         summary += f" (failed: {', '.join(failed)})"
@@ -999,13 +1050,42 @@ def main():
     print(f"  BATCH COMPLETE — {summary}")
     print(f"{'='*80}")
 
+    return succeeded, failed
+
+
+def main():
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = WORK_DIR / "builder.log"
+    tee = _LogTee(log_path)
+    tee.start()
+
+    print("=" * 80)
+    print("  VPS BUILDER PIPELINE — Feature Merge + FAISS Index")
+    print("=" * 80)
+
+    r2 = R2Client()
+
+    # Detect instance ID
+    first_city = os.environ.get("CITY_NAME", "builder")
+    instance_id = _detect_instance_id(r2, first_city)
+    print(f"Instance ID: {instance_id or '(unknown)'}")
+    print(f"Work dir: {WORK_DIR}")
+    print(f"CPU cores: {os.cpu_count()} (OMP_NUM_THREADS={_ncpu})")
+
+    # ── Choose mode: Redis queue vs batch/single ──
+    use_redis = all(os.environ.get(k) for k in ("REDIS_URL", "REDIS_TOKEN", "BUILD_JOB"))
+
+    if use_redis:
+        succeeded, failed = _run_redis_queue(r2, instance_id)
+    else:
+        succeeded, failed = _run_batch(r2, instance_id)
+
     tee.stop()
 
-    # Wait for monitor to pick up status, then clean up
+    # Wait for monitor, then clean up
     print("[INFO] Waiting 30s for monitor to see final status...")
     time.sleep(30)
 
-    # Clean up status files
     for key in [
         f"Status/INDEX_{instance_id}.json",
         f"Status/INDEX_{first_city}_lookup.json",
@@ -1016,7 +1096,6 @@ def main():
         except Exception:
             pass
 
-    # Self-destruct
     self_destruct(r2, first_city, instance_id)
 
 

@@ -3,6 +3,9 @@ numpy>=1.24.0,<2.0
 boto3>=1.28.0
 rich>=14.0.0
 
+# Redis work queue (Upstash HTTP-based, no TLS client needed)
+upstash-redis>=1.0.0
+
 # FAISS (CPU only — index building is CPU-bound, GPU not needed)
 faiss-cpu>=1.7.4
 
