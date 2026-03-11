@@ -160,7 +160,8 @@ def discover_feature_files(r2: R2Client, features_prefix: str) -> Tuple[List[str
     - Chunk mode: {city}_chunk_{NNNN}.npy / Metadata_{city}_chunk_{NNNN}.jsonl
     - Worker mode (legacy): {city}_{worker}.{total}.npy / Metadata_{city}_{worker}.{total}.jsonl
 
-    Files are returned sorted by index for deterministic merge order.
+    Files are returned as PAIRED lists sorted by index — only chunks/workers
+    that have BOTH .npy AND .jsonl are included, to prevent metadata misalignment.
     """
     print(f"\n{'='*80}")
     print("STEP 1: Discovering feature files on R2")
@@ -193,8 +194,6 @@ def discover_feature_files(r2: R2Client, features_prefix: str) -> Tuple[List[str
                 continue
             npy_by_chunk[chunk_num] = key
 
-        npy_files = [npy_by_chunk[i] for i in sorted(npy_by_chunk.keys())]
-
         # Match .jsonl files by chunk number
         jsonl_by_chunk: Dict[int, str] = {}
         for key in raw_jsonl:
@@ -204,19 +203,25 @@ def discover_feature_files(r2: R2Client, features_prefix: str) -> Tuple[List[str
                 continue
             jsonl_by_chunk[chunk_num] = key
 
-        jsonl_files = [jsonl_by_chunk[i] for i in sorted(npy_by_chunk.keys())
-                       if i in jsonl_by_chunk]
+        # Only include chunks that have BOTH .npy AND .jsonl
+        paired_chunks = sorted(set(npy_by_chunk.keys()) & set(jsonl_by_chunk.keys()))
+        npy_files = [npy_by_chunk[i] for i in paired_chunks]
+        jsonl_files = [jsonl_by_chunk[i] for i in paired_chunks]
 
-        missing_jsonl = [i for i in sorted(npy_by_chunk.keys())
-                         if i not in jsonl_by_chunk]
+        missing_jsonl = sorted(set(npy_by_chunk.keys()) - set(jsonl_by_chunk.keys()))
+        missing_npy = sorted(set(jsonl_by_chunk.keys()) - set(npy_by_chunk.keys()))
         if missing_jsonl:
             n = len(missing_jsonl)
-            print(f"[WARN] Missing metadata (.jsonl) for {n} chunks")
+            print(f"[WARN] Skipping {n} chunks with missing .jsonl (would cause misalignment)")
             if n <= 20:
-                print(f"  Chunks: {missing_jsonl}")
+                print(f"  Chunks without metadata: {missing_jsonl}")
+        if missing_npy:
+            n = len(missing_npy)
+            print(f"[WARN] Skipping {n} chunks with missing .npy")
+            if n <= 20:
+                print(f"  Chunks without features: {missing_npy}")
 
-        print(f"\nFound {len(npy_files)} feature files (.npy)")
-        print(f"Found {len(jsonl_files)} metadata files (.jsonl)")
+        print(f"\nFound {len(npy_files)} paired feature+metadata files")
 
         # Show summary for large counts, details for small
         if len(npy_files) <= 20:
@@ -264,8 +269,6 @@ def discover_feature_files(r2: R2Client, features_prefix: str) -> Tuple[List[str
         else:
             print("[WARN] Could not detect worker count from .npy filenames.")
 
-        npy_files = [npy_by_worker[i] for i in sorted(npy_by_worker.keys())]
-
         jsonl_by_worker: Dict[int, str] = {}
         for key in raw_jsonl:
             parsed = _parse_worker_jsonl(key)
@@ -275,16 +278,16 @@ def discover_feature_files(r2: R2Client, features_prefix: str) -> Tuple[List[str
             w_idx, _ = parsed
             jsonl_by_worker[w_idx] = key
 
-        jsonl_files = [jsonl_by_worker[i] for i in sorted(npy_by_worker.keys())
-                       if i in jsonl_by_worker]
+        # Only include workers that have BOTH .npy AND .jsonl
+        paired_workers = sorted(set(npy_by_worker.keys()) & set(jsonl_by_worker.keys()))
+        npy_files = [npy_by_worker[i] for i in paired_workers]
+        jsonl_files = [jsonl_by_worker[i] for i in paired_workers]
 
-        missing_jsonl = [i for i in sorted(npy_by_worker.keys())
-                         if i not in jsonl_by_worker]
+        missing_jsonl = sorted(set(npy_by_worker.keys()) - set(jsonl_by_worker.keys()))
         if missing_jsonl:
-            print(f"[WARN] Missing metadata (.jsonl) for worker indices: {missing_jsonl}")
+            print(f"[WARN] Skipping workers with missing .jsonl (would cause misalignment): {missing_jsonl}")
 
-        print(f"\nFound {len(npy_files)} feature files (.npy)")
-        print(f"Found {len(jsonl_files)} metadata files (.jsonl)")
+        print(f"\nFound {len(npy_files)} paired feature+metadata files")
 
         for key in npy_files:
             size_mb = size_map.get(key, 0) / (1024 * 1024)
@@ -311,10 +314,16 @@ def download_all_files(r2: R2Client, npy_keys: List[str], jsonl_keys: List[str],
     """Download all feature and metadata files from R2.
 
     Uses parallel downloads (4 threads) when there are 50+ files.
+    IMPORTANT: npy_keys[i] and jsonl_keys[i] are PAIRED (same chunk/worker).
+    The returned lists preserve this pairing order.
     """
     print(f"\n{'='*80}")
     print("STEP 2: Downloading feature files from R2")
     print(f"{'='*80}")
+
+    if len(npy_keys) != len(jsonl_keys):
+        print(f"[FATAL] npy/jsonl key count mismatch: {len(npy_keys)} npy vs {len(jsonl_keys)} jsonl")
+        sys.exit(1)
 
     download_dir = WORK_DIR / "downloads"
     download_dir.mkdir(parents=True, exist_ok=True)
@@ -338,9 +347,9 @@ def download_all_files(r2: R2Client, npy_keys: List[str], jsonl_keys: List[str],
             return None, False
         return local_path, False
 
-    npy_paths = []
-    jsonl_paths = []
-    downloaded = [0]
+    # Download all files (order doesn't matter, we rebuild from keys)
+    downloaded_map: Dict[str, Path] = {}  # R2 key → local path
+    downloaded_count = [0]
 
     if use_parallel:
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -352,36 +361,31 @@ def download_all_files(r2: R2Client, npy_keys: List[str], jsonl_keys: List[str],
                     local_path, cached = future.result()
                     if local_path is None:
                         sys.exit(1)
-                    if ftype == "npy":
-                        npy_paths.append(local_path)
-                    else:
-                        jsonl_paths.append(local_path)
+                    downloaded_map[key] = local_path
                 except Exception as e:
                     print(f"  [ERROR] Download exception for {key}: {e}")
                     sys.exit(1)
 
-                downloaded[0] += 1
-                if downloaded[0] % 50 == 0:
-                    pct = int(downloaded[0] / total_files * 100)
-                    reporter.report("download", f"{downloaded[0]}/{total_files} files", pct)
-                    print(f"  Downloaded {downloaded[0]}/{total_files} files ({pct}%)")
+                downloaded_count[0] += 1
+                if downloaded_count[0] % 50 == 0:
+                    pct = int(downloaded_count[0] / total_files * 100)
+                    reporter.report("download", f"{downloaded_count[0]}/{total_files} files", pct)
+                    print(f"  Downloaded {downloaded_count[0]}/{total_files} files ({pct}%)")
     else:
         for key, ftype in all_keys:
             local_path, cached = _download_one((key, ftype))
             if local_path is None:
                 sys.exit(1)
-            if ftype == "npy":
-                npy_paths.append(local_path)
-            else:
-                jsonl_paths.append(local_path)
-            downloaded[0] += 1
+            downloaded_map[key] = local_path
+            downloaded_count[0] += 1
             if not cached:
-                pct = int(downloaded[0] / total_files * 100)
-                reporter.report("download", f"Downloading ({downloaded[0]}/{total_files})", pct)
+                pct = int(downloaded_count[0] / total_files * 100)
+                reporter.report("download", f"Downloading ({downloaded_count[0]}/{total_files})", pct)
 
-    # Sort by filename to ensure deterministic merge order
-    npy_paths.sort(key=lambda p: p.name)
-    jsonl_paths.sort(key=lambda p: p.name)
+    # Rebuild paired lists in the SAME order as the input keys
+    # This preserves the pairing from discover_feature_files
+    npy_paths = [downloaded_map[k] for k in npy_keys]
+    jsonl_paths = [downloaded_map[k] for k in jsonl_keys]
 
     reporter.report("download", f"Downloaded {total_files} files", 100)
     print(f"\n  Total: {len(npy_paths)} .npy files, {len(jsonl_paths)} .jsonl files")
@@ -484,14 +488,22 @@ def merge_features_and_metadata(npy_paths: List[Path], jsonl_paths: List[Path],
     gc.collect()
     print(f"  Merged features written: {total_rows:,} vectors")
 
-    # Merge metadata
-    print("\nMerging metadata...")
+    # Merge metadata — process in PAIRS with per-file count validation
+    print("\nMerging metadata (paired with features)...")
     reporter.report("merge", "Merging metadata", 85)
 
     global_metadata = {}
     global_index = 0
+    alignment_errors = 0
 
-    for jsonl_path in jsonl_paths:
+    for file_idx, (npy_path, jsonl_path) in enumerate(zip(
+        # Re-derive npy_paths order from worker_shapes (same iteration order as feature copy)
+        # We know npy_paths[i] had worker_shapes[i][0] rows
+        npy_paths, jsonl_paths
+    )):
+        expected_rows = worker_shapes[file_idx][0]
+        file_meta_count = 0
+
         with open(jsonl_path, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
@@ -504,10 +516,23 @@ def merge_features_and_metadata(npy_paths: List[Path], jsonl_paths: List[Path],
                         'lng': float(entry.get('lng', 0)),
                     }
                     global_index += 1
+                    file_meta_count += 1
                 except (json.JSONDecodeError, KeyError, ValueError):
                     # Still increment to keep alignment with features
                     global_metadata[str(global_index)] = {'lat': 0.0, 'lng': 0.0}
                     global_index += 1
+                    file_meta_count += 1
+
+        if file_meta_count != expected_rows:
+            print(f"[ERROR] File {file_idx} count mismatch: "
+                  f"{npy_path.name} has {expected_rows} vectors but "
+                  f"{jsonl_path.name} has {file_meta_count} metadata lines!")
+            alignment_errors += 1
+
+    if alignment_errors > 0:
+        print(f"\n[FATAL] {alignment_errors} file(s) have mismatched vector/metadata counts!")
+        print(f"  The index would be corrupted. Fix the source data and re-run.")
+        sys.exit(1)
 
     metadata_path = WORK_DIR / "metadata.json"
     with open(metadata_path, 'w', encoding='utf-8') as f:
@@ -515,11 +540,11 @@ def merge_features_and_metadata(npy_paths: List[Path], jsonl_paths: List[Path],
 
     print(f"  Metadata entries: {len(global_metadata):,}")
 
-    # Validate alignment
+    # Final alignment check
     if global_index != total_rows:
-        print(f"[WARN] Metadata count ({global_index}) != feature count ({total_rows})")
-        print(f"  Using min of both: {min(global_index, total_rows)}")
-        total_rows = min(global_index, total_rows)
+        print(f"[FATAL] Metadata count ({global_index}) != feature count ({total_rows})")
+        print(f"  This indicates a pairing bug. Cannot build a valid index.")
+        sys.exit(1)
 
     reporter.report("merge", f"Merged {total_rows:,} vectors + metadata", 100)
     return merged_features_path, metadata_path, total_rows
