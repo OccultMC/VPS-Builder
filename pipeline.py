@@ -731,7 +731,19 @@ def upload_results(r2: R2Client, features_prefix: str, reporter: StatusReporter)
     print("STEP 5: Uploading results to R2")
     print(f"{'='*80}")
 
-    upload_prefix = f"Index/{'/'.join(features_prefix.rstrip('/').split('/')[1:])}"
+    # Map the features-prefix family to the matching Index family so that
+    # provider-separated runs land in distinct buckets:
+    #   Features/<...>        -> Index/<...>          (Google Street View)
+    #   Features_Apple/<...>  -> Index_Apple/<...>    (Apple Look Around)
+    # We replace just the *first* path segment (which is always Features*),
+    # preserving any suffix (anything after "Features").
+    parts = features_prefix.rstrip('/').split('/')
+    first = parts[0] or 'Features'
+    if first.startswith('Features'):
+        index_first = 'Index' + first[len('Features'):]
+    else:
+        index_first = 'Index'
+    upload_prefix = '/'.join([index_first] + parts[1:])
 
     files_to_upload = [
         (WORK_DIR / "megaloc.index", f"{upload_prefix}/megaloc.index"),
