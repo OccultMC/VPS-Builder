@@ -47,6 +47,18 @@ NBITS = int(os.environ.get("NBITS", "8"))
 TRAIN_SAMPLES = int(os.environ.get("TRAIN_SAMPLES", "1000000"))
 NITER = int(os.environ.get("NITER", "100"))
 
+# GPU settings — applies when faiss-gpu sees a CUDA device.
+# USE_GPU=0 forces CPU even if a GPU is present (useful for debug).
+# GPU_USE_FLOAT16=1 stores PQ codebook + IVF lists in fp16 (≈1/2 VRAM, no
+# meaningful recall hit for 8-bit PQ codes).
+# TRAIN_SAMPLES_GPU caps training-set rows when running on GPU. The full
+# training matrix lives in VRAM during k-means; 8448-dim × 4 bytes ≈ 33 KB
+# per row, so 500K rows ≈ 16.5 GB and fits a 24 GB card with headroom.
+# Drop to 300K for 12 GB cards (≈10 GB), 800K for 48 GB.
+USE_GPU = os.environ.get("USE_GPU", "1") == "1"
+GPU_USE_FLOAT16 = os.environ.get("GPU_USE_FLOAT16", "1") == "1"
+TRAIN_SAMPLES_GPU = int(os.environ.get("TRAIN_SAMPLES_GPU", "500000"))
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Environment Variables
@@ -330,10 +342,15 @@ def download_all_files(r2: R2Client, npy_keys: List[str], jsonl_keys: List[str],
 
     all_keys = [(k, "npy") for k in npy_keys] + [(k, "jsonl") for k in jsonl_keys]
     total_files = len(all_keys)
-    use_parallel = total_files >= 50
-
+    # Always parallel — even small batches benefit. Each worker uses
+    # multipart download (4 streams per file) so 16 outer workers ≈ 64
+    # concurrent TCP streams to R2, well within Cloudflare's per-account
+    # parallelism budget but kind to flaky residential vast hosts.
+    dl_workers = int(os.environ.get("R2_DL_PARALLEL", "16"))
+    use_parallel = total_files > 1
     if use_parallel:
-        print(f"  Using parallel downloads (4 threads) for {total_files} files")
+        print(f"  Parallel download: {dl_workers} file workers × multipart "
+              f"({total_files} files)")
 
     def _download_one(key_type):
         key, ftype = key_type
@@ -353,7 +370,7 @@ def download_all_files(r2: R2Client, npy_keys: List[str], jsonl_keys: List[str],
 
     if use_parallel:
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=dl_workers) as pool:
             future_map = {pool.submit(_download_one, kt): kt for kt in all_keys}
             for future in as_completed(future_map):
                 key, ftype = future_map[future]
@@ -623,8 +640,47 @@ def build_faiss_index(features_path: Path, n_vectors: int,
     # Enable FAISS verbose output for training progress
     index.verbose = True
 
-    # Training — use 33% of vectors, capped at TRAIN_SAMPLES (default 1M)
-    train_samples = min(n_vectors // 3 or n_vectors, TRAIN_SAMPLES)
+    # ── GPU acceleration ────────────────────────────────────────────────────
+    # Training (k-means on the IVF coarse quantizer + PQ codebook fitting) and
+    # .add() (PQ encoding of every vector) are the two CPU-bound phases on
+    # this pipeline. Both port cleanly to faiss-gpu via index_cpu_to_gpu.
+    # The final write_index() needs a CPU index, so we clone back before save.
+    gpu_index = None
+    gpu_resources = None
+    if USE_GPU:
+        try:
+            n_gpus = faiss.get_num_gpus()
+        except Exception as e:
+            n_gpus = 0
+            print(f"  [GPU] faiss.get_num_gpus() failed: {e}")
+        if n_gpus > 0:
+            print(f"\n[GPU] {n_gpus} CUDA device(s) detected — moving index to GPU "
+                  f"(useFloat16={GPU_USE_FLOAT16})")
+            reporter.report("index", "Moving index to GPU", 12)
+            try:
+                gpu_resources = faiss.StandardGpuResources()
+                co = faiss.GpuClonerOptions()
+                co.useFloat16 = GPU_USE_FLOAT16
+                # IVF lists also benefit from fp16 storage; harmless on PQ.
+                co.useFloat16CoarseQuantizer = GPU_USE_FLOAT16
+                gpu_index = faiss.index_cpu_to_gpu(gpu_resources, 0, index, co)
+                # Training/add target follows the GPU index; we keep `index`
+                # bound to the CPU view for the eventual write_index().
+            except Exception as e:
+                print(f"  [GPU] cpu_to_gpu failed ({e}) — falling back to CPU")
+                gpu_index = None
+        else:
+            print("\n[GPU] USE_GPU=1 but no CUDA devices visible — running on CPU")
+
+    # Training — use 33% of vectors, capped at TRAIN_SAMPLES on CPU or
+    # TRAIN_SAMPLES_GPU on GPU (smaller because the matrix lives in VRAM).
+    train_cap = TRAIN_SAMPLES_GPU if gpu_index is not None else TRAIN_SAMPLES
+    train_samples = min(n_vectors // 3 or n_vectors, train_cap)
+
+    if gpu_index is not None:
+        train_bytes_gb = train_samples * FEATURE_DIM * 4 / (1024 ** 3)
+        print(f"  [GPU] Training cap = {train_cap:,} rows "
+              f"({train_bytes_gb:.1f} GB float32 input)")
 
     print(f"\nSampling {train_samples:,} vectors for training...")
     reporter.report("index", f"Sampling {train_samples:,} training vectors", 5)
@@ -649,8 +705,39 @@ def build_faiss_index(features_path: Path, n_vectors: int,
     sys.stdout.flush()
     reporter.report("index", f"Training {INDEX_TYPE} index ({train_samples:,} vectors)", 15)
 
+    # If GPU clone is set, train on it; the CPU `index` is updated implicitly
+    # because faiss's GpuIndex wraps the same parameter buffer (after the
+    # train completes we'll mirror back via index_gpu_to_cpu before save).
+    train_target = gpu_index if gpu_index is not None else index
+
     train_start = time.time()
-    index.train(train_data)
+    try:
+        train_target.train(train_data)
+    except Exception as e:
+        # Most likely failure: VRAM OOM on the k-means step. Fall back to CPU
+        # with the original (larger) TRAIN_SAMPLES cap.
+        if gpu_index is not None:
+            print(f"  [GPU] train() failed ({e}) — falling back to CPU. "
+                  f"Consider lowering TRAIN_SAMPLES_GPU.")
+            del gpu_index
+            gpu_index = None
+            gc.collect()
+            # Re-sample to the larger CPU cap if the original was capped lower
+            cpu_cap = min(n_vectors // 3 or n_vectors, TRAIN_SAMPLES)
+            if cpu_cap > train_samples:
+                if cpu_cap >= n_vectors:
+                    train_indices = np.arange(n_vectors)
+                else:
+                    train_indices = np.sort(rng.choice(n_vectors, size=cpu_cap,
+                                                       replace=False))
+                del train_data
+                train_data = np.ascontiguousarray(
+                    read_features_by_indices(train_indices), dtype=np.float32)
+                del train_indices
+                train_samples = cpu_cap
+            index.train(train_data)
+        else:
+            raise
     train_elapsed = time.time() - train_start
 
     del train_data
@@ -659,8 +746,12 @@ def build_faiss_index(features_path: Path, n_vectors: int,
     sys.stdout.flush()
     reporter.report("index", f"Training done ({train_elapsed/60:.1f} min)", 20)
 
-    # Adding vectors
-    add_batch_size = 10_000
+    # Adding vectors. With GPU active, batches are pushed to VRAM, encoded,
+    # and the resulting PQ codes append directly to the GPU index. Per-batch
+    # transfer dominates at the same wall-clock cost as the CPU path BUT the
+    # encoding itself is ~10-20× faster, which dominates for big indices.
+    add_target = gpu_index if gpu_index is not None else index
+    add_batch_size = 50_000 if gpu_index is not None else 10_000
     total_batches = (n_vectors + add_batch_size - 1) // add_batch_size
     print(f"\nAdding {n_vectors:,} vectors in batches of {add_batch_size:,} ({total_batches} batches)...")
     reporter.report("index", "Adding vectors", 25)
@@ -669,7 +760,7 @@ def build_faiss_index(features_path: Path, n_vectors: int,
     for batch_idx, start in enumerate(range(0, n_vectors, add_batch_size)):
         end = min(start + add_batch_size, n_vectors)
         batch = read_features_slice(start, end)
-        index.add(batch)
+        add_target.add(batch)
         del batch
 
         # Log every batch
@@ -686,7 +777,24 @@ def build_faiss_index(features_path: Path, n_vectors: int,
         if (batch_idx + 1) % 10 == 0:
             gc.collect()
 
-    print(f"Index built with {index.ntotal} vectors")
+    final_target = gpu_index if gpu_index is not None else index
+    print(f"Index built with {final_target.ntotal} vectors")
+
+    # Move GPU index back to CPU so faiss.write_index can serialize it.
+    if gpu_index is not None:
+        print("\n[GPU] Moving index back to CPU for serialization...")
+        reporter.report("index", "Cloning index GPU->CPU", 91)
+        index = faiss.index_gpu_to_cpu(gpu_index)
+        del gpu_index
+        gpu_index = None
+        # Release GPU memory before the (large) save step.
+        if gpu_resources is not None:
+            try:
+                gpu_resources.noTempMemory()
+            except Exception:
+                pass
+            gpu_resources = None
+        gc.collect()
 
     # Save index
     index_path = WORK_DIR / "megaloc.index"

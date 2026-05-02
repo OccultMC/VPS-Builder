@@ -6,11 +6,11 @@ rich>=14.0.0
 # Redis work queue (Upstash HTTP-based, no TLS client needed)
 upstash-redis>=1.0.0
 
-# FAISS (CPU only — index building is CPU-bound, GPU not needed)
-faiss-cpu>=1.7.4
+# FAISS — NVIDIA's CUDA-12 build. Training/add run on GPU; final index
+# is cloned back to CPU before write_index(). Set USE_GPU=0 to fall back
+# to CPU mode (forces faiss to behave like faiss-cpu).
+faiss-gpu-cu12>=1.9.0
 
-# ML (for torch.hub MegaLoc model loading — needed for feature dimension validation)
-torch>=2.0.0
-torchvision>=0.15.0
+# safetensors retained for any consumer of MegaLoc weights at index time;
+# torch / torchvision / timm come from the pytorch base image.
 safetensors>=0.3.0
-timm>=0.9.0
