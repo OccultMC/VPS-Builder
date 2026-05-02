@@ -615,12 +615,38 @@ def build_faiss_index(features_path: Path, n_vectors: int,
                 break
         print(f"  Auto-adjusted M: {M} -> {m} (must divide {FEATURE_DIM})")
 
-    # Auto-adjust nlist if needed
+    # ── Auto-tune index params for this city's vector count ────────────────
+    # AUTO_TUNE=1 (default) overrides NLIST / NITER / TRAIN_SAMPLES with values
+    # sized for the dataset. Set AUTO_TUNE=0 to use raw env values.
+    import math as _math
+    AUTO_TUNE = os.environ.get("AUTO_TUNE", "1") == "1"
+
     nlist = NLIST
-    max_nlist = n_vectors // 39
-    if nlist > max_nlist:
-        nlist = max(64, 2 ** int(np.log2(max_nlist)))
-        print(f"  Auto-adjusted nlist: {NLIST} -> {nlist}")
+    niter_eff = NITER
+    train_target_eff = TRAIN_SAMPLES  # default; refined in train-cap section
+
+    if AUTO_TUNE and INDEX_TYPE == "ivfpq":
+        # Faiss + literature: nlist ≈ 4·√N rounded to nearest power of 2.
+        # Floor at 256 (too few cells = scan-heavy queries), and cap at
+        # n_vectors//39 (faiss requires >=39 training points per cell).
+        target = 4 * _math.sqrt(n_vectors)
+        auto = 2 ** round(_math.log2(max(target, 256)))
+        auto = min(auto, max(256, n_vectors // 39))
+        if auto != NLIST:
+            print(f"  [auto-tune] nlist {NLIST} -> {auto} for {n_vectors:,} vectors")
+            nlist = auto
+        # niter: 50 is fully converged for IVF k-means at nlist<=32k.
+        # 100 is the historical "safe" default but doubles training time
+        # for ~no recall improvement.
+        if NITER >= 100:
+            niter_eff = 50
+            print(f"  [auto-tune] niter {NITER} -> {niter_eff} (sufficient convergence)")
+    else:
+        # Legacy fallback: raw env nlist with the old too-large guard
+        max_nlist = n_vectors // 39
+        if nlist > max_nlist:
+            nlist = max(64, 2 ** int(np.log2(max_nlist)))
+            print(f"  Auto-adjusted nlist: {NLIST} -> {nlist}")
 
     # Create index with Inner Product metric
     metric = faiss.METRIC_INNER_PRODUCT
@@ -628,9 +654,9 @@ def build_faiss_index(features_path: Path, n_vectors: int,
     if INDEX_TYPE == "ivfpq":
         quantizer = faiss.IndexFlatIP(FEATURE_DIM)
         index = faiss.IndexIVFPQ(quantizer, FEATURE_DIM, nlist, m, NBITS, metric)
-        index.cp.niter = NITER
+        index.cp.niter = niter_eff
         index.cp.verbose = True  # Log clustering progress
-        print(f"  Index: IVFPQ, nlist={nlist}, m={m}, nbits={NBITS}, niter={NITER}")
+        print(f"  Index: IVFPQ, nlist={nlist}, m={m}, nbits={NBITS}, niter={niter_eff}")
     elif INDEX_TYPE == "pq":
         index = faiss.IndexPQ(FEATURE_DIM, m, NBITS, metric)
         print(f"  Index: PQ, m={m}, nbits={NBITS}")
@@ -687,13 +713,17 @@ def build_faiss_index(features_path: Path, n_vectors: int,
         else:
             print("\n[GPU] USE_GPU=1 but no CUDA devices visible — running on CPU")
 
-    # Training — use 33% of vectors, capped at TRAIN_SAMPLES on a true CPU
-    # host or TRAIN_SAMPLES_GPU when GPU was requested. The latter applies
-    # even if the GPU clone failed (or was skipped due to unsupported index
-    # type) because GPU-class vast hosts often don't have enough system RAM
-    # to safely materialize the 1M-row training matrix (~32 GB float32).
+    # Training set sizing.
+    # AUTO_TUNE: target ≈ max(256·nlist, 200K), capped at 2M and N//3.
+    # The 256·nlist target gives faiss enough samples per IVF cell for
+    # well-conditioned k-means (faiss recommends 30-256 per cell).
+    # Then clamped further by GPU VRAM (TRAIN_SAMPLES_GPU) or by the host
+    # RAM ceiling (TRAIN_SAMPLES) depending on where train() will run.
+    if AUTO_TUNE and INDEX_TYPE == "ivfpq":
+        train_target_eff = max(256 * nlist, 200_000)
+        train_target_eff = min(train_target_eff, 2_000_000)
     train_cap = TRAIN_SAMPLES_GPU if gpu_requested else TRAIN_SAMPLES
-    train_samples = min(n_vectors // 3 or n_vectors, train_cap)
+    train_samples = min(n_vectors // 3 or n_vectors, train_target_eff, train_cap)
 
     if gpu_requested:
         train_bytes_gb = train_samples * FEATURE_DIM * 4 / (1024 ** 3)
@@ -786,6 +816,8 @@ def build_faiss_index(features_path: Path, n_vectors: int,
             gc.collect()
 
     final_target = gpu_index if gpu_index is not None else index
+    # Capture gpu actually-used flag before we delete gpu_index for the save step
+    gpu_used_for_build = gpu_index is not None
     print(f"Index built with {final_target.ntotal} vectors")
 
     # Move GPU index back to CPU so faiss.write_index can serialize it.
@@ -816,7 +848,9 @@ def build_faiss_index(features_path: Path, n_vectors: int,
     print(f"  Raw features size: {raw_size_mb:.2f} MB")
     print(f"  Compression ratio: {raw_size_mb / index_size_mb:.1f}x")
 
-    # Save config
+    # Save config — capture FINAL values actually used (post-auto-tune),
+    # not the env defaults. Downstream search code reads this file to
+    # configure the same index for queries.
     config = {
         'n_vectors': n_vectors,
         'dimension': FEATURE_DIM,
@@ -824,6 +858,17 @@ def build_faiss_index(features_path: Path, n_vectors: int,
         'nlist': nlist,
         'm': m,
         'nbits': NBITS,
+        'niter': niter_eff if INDEX_TYPE == "ivfpq" else None,
+        'metric': 'inner_product',
+        'train_samples_used': train_samples,
+        'train_data_mb': round(train_samples * FEATURE_DIM * 4 / (1024 ** 2)),
+        'index_size_mb': round(index_size_mb, 2),
+        'raw_size_mb': round(raw_size_mb, 2),
+        'compression_ratio': round(raw_size_mb / index_size_mb, 1),
+        'training_seconds': round(train_elapsed, 1),
+        'gpu_used': gpu_used_for_build,
+        'gpu_requested': gpu_requested,
+        'auto_tuned': AUTO_TUNE,
         'index_file': 'megaloc.index',
         'metadata_file': 'metadata.json',
         'features_file': 'features.bin',
