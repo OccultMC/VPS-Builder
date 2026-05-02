@@ -643,10 +643,19 @@ def build_faiss_index(features_path: Path, n_vectors: int,
     # ── GPU acceleration ────────────────────────────────────────────────────
     # Training (k-means on the IVF coarse quantizer + PQ codebook fitting) and
     # .add() (PQ encoding of every vector) are the two CPU-bound phases on
-    # this pipeline. Both port cleanly to faiss-gpu via index_cpu_to_gpu.
+    # this pipeline. Both port cleanly to faiss-gpu via index_cpu_to_gpu when
+    # the index type is GPU-supported (IndexFlat*, IndexIVF*PQ). IndexPQ has
+    # no GPU implementation in faiss-gpu — we skip the attempt for it.
     # The final write_index() needs a CPU index, so we clone back before save.
+    GPU_SUPPORTED_TYPES = {"ivfpq"}
     gpu_index = None
     gpu_resources = None
+    # gpu_requested tracks user intent (USE_GPU=1 + GPU visible) regardless of
+    # whether the clone actually succeeded. We use it to size the training
+    # set: a host picked for its GPU is not necessarily a host with 32+ GB
+    # of system RAM, so the smaller TRAIN_SAMPLES_GPU cap is safer for the
+    # CPU fallback too.
+    gpu_requested = False
     if USE_GPU:
         try:
             n_gpus = faiss.get_num_gpus()
@@ -654,32 +663,42 @@ def build_faiss_index(features_path: Path, n_vectors: int,
             n_gpus = 0
             print(f"  [GPU] faiss.get_num_gpus() failed: {e}")
         if n_gpus > 0:
-            print(f"\n[GPU] {n_gpus} CUDA device(s) detected — moving index to GPU "
-                  f"(useFloat16={GPU_USE_FLOAT16})")
-            reporter.report("index", "Moving index to GPU", 12)
-            try:
-                gpu_resources = faiss.StandardGpuResources()
-                co = faiss.GpuClonerOptions()
-                co.useFloat16 = GPU_USE_FLOAT16
-                # IVF lists also benefit from fp16 storage; harmless on PQ.
-                co.useFloat16CoarseQuantizer = GPU_USE_FLOAT16
-                gpu_index = faiss.index_cpu_to_gpu(gpu_resources, 0, index, co)
-                # Training/add target follows the GPU index; we keep `index`
-                # bound to the CPU view for the eventual write_index().
-            except Exception as e:
-                print(f"  [GPU] cpu_to_gpu failed ({e}) — falling back to CPU")
-                gpu_index = None
+            gpu_requested = True
+            if INDEX_TYPE not in GPU_SUPPORTED_TYPES:
+                print(f"\n[GPU] {n_gpus} CUDA device(s) detected but INDEX_TYPE='{INDEX_TYPE}' "
+                      f"has no faiss-gpu implementation. Running on CPU "
+                      f"(switch INDEX_TYPE to 'ivfpq' to use GPU).")
+            else:
+                print(f"\n[GPU] {n_gpus} CUDA device(s) detected — moving index to GPU "
+                      f"(useFloat16={GPU_USE_FLOAT16})")
+                reporter.report("index", "Moving index to GPU", 12)
+                try:
+                    gpu_resources = faiss.StandardGpuResources()
+                    co = faiss.GpuClonerOptions()
+                    co.useFloat16 = GPU_USE_FLOAT16
+                    # IVF lists also benefit from fp16 storage; harmless on PQ.
+                    co.useFloat16CoarseQuantizer = GPU_USE_FLOAT16
+                    gpu_index = faiss.index_cpu_to_gpu(gpu_resources, 0, index, co)
+                    # Training/add target follows the GPU index; we keep `index`
+                    # bound to the CPU view for the eventual write_index().
+                except Exception as e:
+                    print(f"  [GPU] cpu_to_gpu failed ({e}) — falling back to CPU")
+                    gpu_index = None
         else:
             print("\n[GPU] USE_GPU=1 but no CUDA devices visible — running on CPU")
 
-    # Training — use 33% of vectors, capped at TRAIN_SAMPLES on CPU or
-    # TRAIN_SAMPLES_GPU on GPU (smaller because the matrix lives in VRAM).
-    train_cap = TRAIN_SAMPLES_GPU if gpu_index is not None else TRAIN_SAMPLES
+    # Training — use 33% of vectors, capped at TRAIN_SAMPLES on a true CPU
+    # host or TRAIN_SAMPLES_GPU when GPU was requested. The latter applies
+    # even if the GPU clone failed (or was skipped due to unsupported index
+    # type) because GPU-class vast hosts often don't have enough system RAM
+    # to safely materialize the 1M-row training matrix (~32 GB float32).
+    train_cap = TRAIN_SAMPLES_GPU if gpu_requested else TRAIN_SAMPLES
     train_samples = min(n_vectors // 3 or n_vectors, train_cap)
 
-    if gpu_index is not None:
+    if gpu_requested:
         train_bytes_gb = train_samples * FEATURE_DIM * 4 / (1024 ** 3)
-        print(f"  [GPU] Training cap = {train_cap:,} rows "
+        target = "GPU" if gpu_index is not None else "CPU (GPU-host fallback)"
+        print(f"  [{target}] Training cap = {train_cap:,} rows "
               f"({train_bytes_gb:.1f} GB float32 input)")
 
     print(f"\nSampling {train_samples:,} vectors for training...")
@@ -715,26 +734,15 @@ def build_faiss_index(features_path: Path, n_vectors: int,
         train_target.train(train_data)
     except Exception as e:
         # Most likely failure: VRAM OOM on the k-means step. Fall back to CPU
-        # with the original (larger) TRAIN_SAMPLES cap.
+        # using the SAME training set — re-sampling to a larger size on the
+        # CPU path can OOM the host RAM (8448-dim × 4 bytes × N samples).
         if gpu_index is not None:
-            print(f"  [GPU] train() failed ({e}) — falling back to CPU. "
-                  f"Consider lowering TRAIN_SAMPLES_GPU.")
+            print(f"  [GPU] train() failed ({e}) — falling back to CPU "
+                  f"with the same {train_samples:,}-row training set. "
+                  f"(Lower TRAIN_SAMPLES_GPU if this keeps happening.)")
             del gpu_index
             gpu_index = None
             gc.collect()
-            # Re-sample to the larger CPU cap if the original was capped lower
-            cpu_cap = min(n_vectors // 3 or n_vectors, TRAIN_SAMPLES)
-            if cpu_cap > train_samples:
-                if cpu_cap >= n_vectors:
-                    train_indices = np.arange(n_vectors)
-                else:
-                    train_indices = np.sort(rng.choice(n_vectors, size=cpu_cap,
-                                                       replace=False))
-                del train_data
-                train_data = np.ascontiguousarray(
-                    read_features_by_indices(train_indices), dtype=np.float32)
-                del train_indices
-                train_samples = cpu_cap
             index.train(train_data)
         else:
             raise
