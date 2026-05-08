@@ -22,13 +22,16 @@ from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
-# Multipart download tuning. R2 + residential vast hosts choke on too many
-# parallel TCP streams; 4 parts × 32 MB at 16-way file parallelism (set in
-# pipeline.py) lands ~64 concurrent streams which is the sweet spot.
+# Multipart download tuning. Defaults target a high-bandwidth ENAM host
+# (~2 Gbps / 250 MB/s); 32 file workers × 8 streams × 64 MB parts
+# saturates that pipe without ballooning the connection pool.
+# All knobs env-overridable so a residential / low-bandwidth host can
+# dial the streams down.
+_MP_CHUNK_MB = int(os.environ.get("R2_DL_MULTIPART_CHUNK_MB", "64"))
 _DOWNLOAD_TRANSFER_CONFIG = TransferConfig(
-    multipart_threshold=32 * 1024 * 1024,
-    multipart_chunksize=32 * 1024 * 1024,
-    max_concurrency=int(os.environ.get("R2_DL_MULTIPART_CONCURRENCY", "4")),
+    multipart_threshold=_MP_CHUNK_MB * 1024 * 1024,
+    multipart_chunksize=_MP_CHUNK_MB * 1024 * 1024,
+    max_concurrency=int(os.environ.get("R2_DL_MULTIPART_CONCURRENCY", "8")),
     use_threads=True,
 )
 
@@ -65,7 +68,7 @@ class R2Client:
             config=Config(
                 retries={"max_attempts": 3, "mode": "adaptive"},
                 s3={"addressing_style": "path"},
-                max_pool_connections=int(os.environ.get("R2_POOL_SIZE", "64")),
+                max_pool_connections=int(os.environ.get("R2_POOL_SIZE", "256")),
                 connect_timeout=15,
                 read_timeout=120,
                 tcp_keepalive=True,

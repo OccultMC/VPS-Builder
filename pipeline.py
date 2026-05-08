@@ -164,7 +164,7 @@ def _parse_chunk_jsonl(key: str) -> Optional[int]:
     return None
 
 
-def discover_feature_files(r2: R2Client, features_prefix: str) -> Tuple[List[str], List[str]]:
+def discover_feature_files(r2: R2Client, features_prefix: str) -> Tuple[List[str], List[str], Dict[str, int]]:
     """
     List all .npy and .jsonl files under the features prefix.
 
@@ -314,12 +314,182 @@ def discover_feature_files(r2: R2Client, features_prefix: str) -> Tuple[List[str
         print("[FATAL] No metadata files found!")
         sys.exit(1)
 
-    return npy_files, jsonl_files
+    return npy_files, jsonl_files, size_map
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Step 2: Download all feature files
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def download_and_merge_streaming(r2: R2Client, npy_keys: List[str], jsonl_keys: List[str],
+                                  size_map: Dict[str, int], reporter: StatusReporter
+                                  ) -> Tuple[Path, List[Path], int, List[int]]:
+    """Pipelined download + memcpy into pre-allocated features.bin.
+
+    Replaces the old two-step (download_all_files → merge feature copy) with
+    a single streaming pass:
+
+      * pre-compute per-chunk row count + global offset from R2 file sizes
+        (no extra HEAD calls — list_objects_v2 already gave us sizes)
+      * pre-allocate features.bin sparse to total_rows × 8448 × 4 bytes
+      * N download workers each: download NPY + JSONL → memcpy NPY data into
+        features.bin at known offset → delete source NPY
+      * by the time downloads finish, features merge is also finished
+
+    Tunables (env vars, all optional):
+      R2_DL_PARALLEL              file workers (default 32, was 16)
+      R2_DL_MULTIPART_CONCURRENCY streams per file (default 8, was 4)
+      R2_DL_MULTIPART_CHUNK_MB    multipart chunk size MB (default 64, was 32)
+      R2_POOL_SIZE                connection pool (default 256, was 64)
+
+    Returns (features_path, jsonl_paths_in_input_order, total_rows, rows_per_chunk).
+    """
+    print(f"\n{'='*80}")
+    print("STEP 2+3: Download + merge (streaming, pipelined)")
+    print(f"{'='*80}")
+
+    if len(npy_keys) != len(jsonl_keys):
+        print(f"[FATAL] npy/jsonl key count mismatch")
+        sys.exit(1)
+
+    download_dir = WORK_DIR / "downloads"
+    download_dir.mkdir(parents=True, exist_ok=True)
+
+    # Compute row counts + offsets from sizes. NPY layout for shape (N, 8448) f32:
+    #   small fixed header (~128 B) + N × 8448 × 4 bytes of data.
+    # Determine header overhead from any chunk's full size — chunks share the
+    # same descriptor and their headers are byte-identical for the same shape.
+    row_size_bytes = FEATURE_DIM * 4
+    rows_per_chunk: List[int] = []
+    offsets: List[int] = []
+    cum = 0
+    header_bytes = 128  # standard NPY header for these shapes
+    for k in npy_keys:
+        sz = size_map.get(k, 0)
+        if sz <= 0:
+            print(f"[FATAL] missing size for {k}")
+            sys.exit(1)
+        n = (sz - header_bytes) // row_size_bytes
+        if n <= 0 or (sz - header_bytes) % row_size_bytes != 0:
+            # Header isn't 128 bytes — fall back to mmap'ing the file post-download
+            # by marking with sentinel. But warn now.
+            print(f"[WARN] non-standard NPY header for {k} (size={sz}); "
+                  f"will fix offset post-download")
+            n = -1
+        rows_per_chunk.append(n)
+        offsets.append(cum)
+        if n > 0:
+            cum += n
+    if any(n < 0 for n in rows_per_chunk):
+        # Resolve shapes the slow way: pre-fetch one chunk to learn the actual
+        # header length, then re-derive.
+        print("[INFO] resolving NPY header length from first chunk...")
+        sample_key = npy_keys[0]
+        sample_local = download_dir / "_header_probe.npy"
+        r2.download_file(sample_key, str(sample_local))
+        sample_arr = np.load(str(sample_local), mmap_mode='r')
+        sample_n = sample_arr.shape[0]
+        sample_size = sample_local.stat().st_size
+        header_bytes = sample_size - sample_n * row_size_bytes
+        del sample_arr
+        sample_local.unlink()
+        print(f"[INFO] resolved header={header_bytes} bytes, sample shape=({sample_n}, {FEATURE_DIM})")
+        # re-derive
+        rows_per_chunk = []
+        offsets = []
+        cum = 0
+        for k in npy_keys:
+            sz = size_map[k]
+            n = (sz - header_bytes) // row_size_bytes
+            rows_per_chunk.append(n)
+            offsets.append(cum)
+            cum += n
+    total_rows = cum
+
+    total_size_gb = total_rows * FEATURE_DIM * 4 / (1024 ** 3)
+    print(f"  Chunks: {len(npy_keys)}  total rows: {total_rows:,}  merged size: {total_size_gb:.2f} GB")
+
+    # Pre-allocate features.bin (sparse)
+    features_path = WORK_DIR / "features.bin"
+    print(f"  Allocating sparse features.bin ({total_size_gb:.2f} GB)...")
+    with open(features_path, 'wb') as f:
+        f.seek(total_rows * row_size_bytes - 1)
+        f.write(b'\0')
+
+    dl_workers = int(os.environ.get("R2_DL_PARALLEL", "32"))
+    print(f"  Pipelined download: {dl_workers} file workers (multipart streams set in TransferConfig)")
+
+    jsonl_paths_out: List[Optional[Path]] = [None] * len(npy_keys)
+    completed = [0]
+
+    def _process_chunk(i: int):
+        npy_key = npy_keys[i]
+        jsonl_key = jsonl_keys[i]
+        offset_rows = offsets[i]
+        expected_rows = rows_per_chunk[i]
+
+        npy_local = download_dir / npy_key.split("/")[-1]
+        jsonl_local = download_dir / jsonl_key.split("/")[-1]
+
+        # JSONL is tiny — single GET via download_file is fine.
+        if not jsonl_local.exists():
+            ok = r2.download_file(jsonl_key, str(jsonl_local))
+            if not ok:
+                raise RuntimeError(f"jsonl download failed: {jsonl_key}")
+
+        # NPY: download → memcpy at offset → delete
+        if not npy_local.exists():
+            ok = r2.download_file(npy_key, str(npy_local))
+            if not ok:
+                raise RuntimeError(f"npy download failed: {npy_key}")
+
+        src = np.load(str(npy_local), mmap_mode='r')
+        actual_n = src.shape[0]
+        if actual_n != expected_rows:
+            raise RuntimeError(
+                f"row count mismatch chunk {i}: expected {expected_rows}, "
+                f"got {actual_n} — offsets would misalign. Re-derive header_bytes."
+            )
+
+        # Write src bytes to features.bin at offset_rows × row_size_bytes
+        write_bytes = row_size_bytes * actual_n
+        with open(features_path, 'r+b') as out:
+            out.seek(offset_rows * row_size_bytes)
+            # tobytes copies — for huge arrays we could use src.view(np.uint8).tofile,
+            # but tobytes is fine and explicit.
+            out.write(src.tobytes())
+
+        del src
+        try:
+            npy_local.unlink()
+        except OSError:
+            pass
+
+        jsonl_paths_out[i] = jsonl_local
+        n_done = completed[0] + 1
+        completed[0] = n_done
+        if n_done % 20 == 0 or n_done == len(npy_keys):
+            pct = int(n_done / len(npy_keys) * 100)
+            reporter.report("download+merge", f"{n_done}/{len(npy_keys)} chunks", pct)
+            print(f"  done {n_done}/{len(npy_keys)} ({pct}%)  "
+                  f"({write_bytes / (1024**2):.0f} MB written at offset "
+                  f"{offset_rows * row_size_bytes / (1024**3):.2f} GB)")
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=dl_workers) as pool:
+        futs = [pool.submit(_process_chunk, i) for i in range(len(npy_keys))]
+        for f in as_completed(futs):
+            try:
+                f.result()
+            except Exception as e:
+                print(f"[FATAL] chunk worker failed: {e}")
+                sys.exit(1)
+
+    print(f"  Streaming download+merge complete: {total_rows:,} vectors -> {features_path}")
+    reporter.report("download+merge", f"all {len(npy_keys)} chunks merged", 100)
+
+    return features_path, [jsonl_paths_out[i] for i in range(len(npy_keys))], total_rows, rows_per_chunk
+
 
 def download_all_files(r2: R2Client, npy_keys: List[str], jsonl_keys: List[str],
                        reporter: StatusReporter) -> Tuple[List[Path], List[Path]]:
@@ -412,6 +582,61 @@ def download_all_files(r2: R2Client, npy_keys: List[str], jsonl_keys: List[str],
 # ═══════════════════════════════════════════════════════════════════════════════
 # Step 3: Merge features and metadata
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _merge_metadata_only(jsonl_paths: List[Path], rows_per_chunk: List[int],
+                          total_rows: int, reporter: StatusReporter) -> Path:
+    """Build the merged metadata.json after features.bin is already populated
+    by download_and_merge_streaming(). Iterates the JSONL files in chunk order
+    so global indices line up with feature offsets exactly.
+    """
+    print(f"\n{'='*80}")
+    print("STEP 3b: Merging metadata (features already streamed)")
+    print(f"{'='*80}")
+    reporter.report("merge", "Merging metadata", 80)
+
+    global_metadata: Dict[str, Dict] = {}
+    global_index = 0
+    alignment_errors = 0
+    for file_idx, jsonl_path in enumerate(jsonl_paths):
+        expected_rows = rows_per_chunk[file_idx]
+        file_meta_count = 0
+        with open(jsonl_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    global_metadata[str(global_index)] = {
+                        'panoid': str(entry.get('panoid', '')),
+                        'lat': float(entry.get('lat', 0)),
+                        'lng': float(entry.get('lng', 0)),
+                        'fi_local': int(entry.get('feature_index', 0)),
+                    }
+                except (json.JSONDecodeError, KeyError, ValueError):
+                    global_metadata[str(global_index)] = {
+                        'panoid': '', 'lat': 0.0, 'lng': 0.0, 'fi_local': 0,
+                    }
+                global_index += 1
+                file_meta_count += 1
+        if file_meta_count != expected_rows:
+            print(f"[ERROR] {jsonl_path.name}: {file_meta_count} meta lines "
+                  f"vs {expected_rows} feature rows")
+            alignment_errors += 1
+
+    if alignment_errors > 0:
+        print(f"[FATAL] {alignment_errors} chunks have meta/feature mismatch")
+        sys.exit(1)
+    if global_index != total_rows:
+        print(f"[FATAL] metadata count {global_index} != feature count {total_rows}")
+        sys.exit(1)
+
+    metadata_path = WORK_DIR / "metadata.json"
+    with open(metadata_path, 'w', encoding='utf-8') as f:
+        json.dump(global_metadata, f)
+    print(f"  Metadata entries: {len(global_metadata):,}")
+    return metadata_path
+
 
 def merge_features_and_metadata(npy_paths: List[Path], jsonl_paths: List[Path],
                                  reporter: StatusReporter) -> Tuple[Path, Path, int]:
@@ -529,14 +754,24 @@ def merge_features_and_metadata(npy_paths: List[Path], jsonl_paths: List[Path],
                 try:
                     entry = json.loads(line)
                     global_metadata[str(global_index)] = {
+                        'panoid': str(entry.get('panoid', '')),
                         'lat': float(entry.get('lat', 0)),
                         'lng': float(entry.get('lng', 0)),
+                        # Local feature index within the source chunk (0..N-1).
+                        # Lets the server identify which directional view of the
+                        # pano the match came from, useful for debug + re-fetch.
+                        'fi_local': int(entry.get('feature_index', 0)),
                     }
                     global_index += 1
                     file_meta_count += 1
                 except (json.JSONDecodeError, KeyError, ValueError):
                     # Still increment to keep alignment with features
-                    global_metadata[str(global_index)] = {'lat': 0.0, 'lng': 0.0}
+                    global_metadata[str(global_index)] = {
+                        'panoid': '',
+                        'lat': 0.0,
+                        'lng': 0.0,
+                        'fi_local': 0,
+                    }
                     global_index += 1
                     file_meta_count += 1
 
@@ -873,6 +1108,41 @@ def build_faiss_index(features_path: Path, n_vectors: int,
         'metadata_file': 'metadata.json',
         'features_file': 'features.bin',
     }
+
+    # ── Geo enrichment for the inference server's "Search this city" feature ──
+    # Computes the city centroid (mean lat/lng) plus a small set of evenly-
+    # spaced sample points. The sample points let the offline polygon
+    # backfill (zelesis-inference/backfill_polygons.py) attribute this city
+    # to its urban polygon without re-downloading metadata.json.
+    try:
+        metadata_path = WORK_DIR / "metadata.json"
+        if metadata_path.exists():
+            with open(metadata_path, 'r', encoding='utf-8') as f:
+                md = json.load(f)
+            items = list(md.values()) if isinstance(md, dict) else list(md)
+            lats = [v.get("lat") for v in items if isinstance(v, dict) and isinstance(v.get("lat"), (int, float))]
+            lngs = [v.get("lng") for v in items if isinstance(v, dict) and isinstance(v.get("lng"), (int, float))]
+            if lats:
+                config["center_lat"] = sum(lats) / len(lats)
+                config["center_lng"] = sum(lngs) / len(lngs)
+                config["center_n"] = len(lats)
+            # 20 evenly-spaced sample (lat, lng) tuples. Enough variety for
+            # the polygon backfill to find a hit even if the city's edge
+            # bleeds across an admin boundary.
+            sample_pairs = []
+            step = max(1, len(items) // 20)
+            for v in items[::step][:20]:
+                if isinstance(v, dict):
+                    lat, lng = v.get("lat"), v.get("lng")
+                    if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
+                        sample_pairs.append([lat, lng])
+            if sample_pairs:
+                config["sample_points"] = sample_pairs
+            print(f"  Geo enrichment: center=({config.get('center_lat')}, {config.get('center_lng')}) "
+                  f"sample_points={len(sample_pairs)}")
+    except Exception as e:
+        print(f"  Geo enrichment skipped: {e}")
+
     config_path = WORK_DIR / "config.json"
     with open(config_path, 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=2)
@@ -1085,15 +1355,21 @@ def _build_one_city(r2: R2Client, features_prefix: str, city_name: str,
     reporter.report("init", f"{tag} Starting {city_name}", 0)
 
     try:
-        # Step 1: Discover files
-        npy_keys, jsonl_keys = discover_feature_files(r2, features_prefix)
+        # Step 1: Discover files (also returns size_map for offset pre-compute)
+        npy_keys, jsonl_keys, size_map = discover_feature_files(r2, features_prefix)
 
-        # Step 2: Download
-        npy_paths, jsonl_paths = download_all_files(r2, npy_keys, jsonl_keys, reporter)
+        # Step 2+3 fused: pipelined download + memcpy into pre-allocated
+        # features.bin. By the time the last byte is on disk, the merged
+        # feature file is also done — no separate "STEP 3 merge features"
+        # phase. Metadata.json is still merged in chunk order below.
+        features_path, jsonl_paths, total_vectors, _rows_per_chunk = \
+            download_and_merge_streaming(r2, npy_keys, jsonl_keys, size_map, reporter)
 
-        # Step 3: Merge
-        features_path, metadata_path, total_vectors = merge_features_and_metadata(
-            npy_paths, jsonl_paths, reporter
+        # Step 3b: merge metadata only (features already merged above).
+        # Reuse merge_features_and_metadata's metadata branch by passing in
+        # the already-merged feature path so it skips the copy phase.
+        metadata_path = _merge_metadata_only(
+            jsonl_paths, _rows_per_chunk, total_vectors, reporter
         )
 
         # Step 4: Build FAISS index
