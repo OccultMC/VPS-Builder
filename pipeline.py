@@ -930,29 +930,47 @@ def build_faiss_index(features_path: Path, n_vectors: int,
                       f"has no faiss-gpu implementation. Running on CPU "
                       f"(switch INDEX_TYPE to 'ivfpq' to use GPU).")
             else:
-                print(f"\n[GPU] {n_gpus} CUDA device(s) detected — moving index to GPU "
-                      f"(useFloat16={GPU_USE_FLOAT16})")
-                reporter.report("index", "Moving index to GPU", 12)
+                print(f"\n[GPU] {n_gpus} CUDA device(s) detected — building index "
+                      f"directly on GPU (useFloat16={GPU_USE_FLOAT16})")
+                reporter.report("index", "Constructing GPU index", 12)
                 try:
                     gpu_resources = faiss.StandardGpuResources()
-                    co = faiss.GpuClonerOptions()
-                    co.useFloat16 = GPU_USE_FLOAT16
-                    # IVF lists also benefit from fp16 storage; harmless on PQ.
-                    co.useFloat16CoarseQuantizer = GPU_USE_FLOAT16
-                    # Interleaved layout lets faiss-gpu accept arbitrary M
-                    # (sub-quantizer count). Without it, only the standard set
-                    # {1,2,3,4,8,12,16,20,24,28,32,40,48,56,64,96} is allowed
-                    # and any other M (e.g. M=256 for higher recall) silently
-                    # falls back to CPU — which on multi-million-vector indexes
-                    # turns into days of swap-thrashing k-means. Costs ~10-30%
-                    # search latency vs standard layout; trivial vs the build
-                    # time it saves and the recall it preserves.
-                    co.useInterleavedLayout = True
-                    gpu_index = faiss.index_cpu_to_gpu(gpu_resources, 0, index, co)
-                    # Training/add target follows the GPU index; we keep `index`
-                    # bound to the CPU view for the eventual write_index().
+
+                    # Build GpuIndexIVFPQ DIRECTLY rather than cloning the
+                    # CPU index. Reason: GpuClonerOptions has no field for
+                    # `interleavedLayout` — it lives on GpuIndexIVFPQConfig,
+                    # which the cloner constructs internally with defaults.
+                    # Without interleaved layout, faiss-gpu's
+                    # IVFPQ::isSupportedPQCodeLength(M) only accepts the
+                    # standard set {1,2,3,4,8,12,16,20,24,28,32,40,48,56,64,
+                    # 96}, so any M outside that (e.g. M=256 for higher
+                    # recall) crashes verifyPQSettings_() and silently falls
+                    # back to CPU — which on multi-million-vector indexes
+                    # is days of swap-thrashing k-means. Direct construction
+                    # lets us set the config field that actually matters.
+                    config = faiss.GpuIndexIVFPQConfig()
+                    config.device = 0
+                    config.useFloat16LookupTables = GPU_USE_FLOAT16
+                    config.interleavedLayout = True
+
+                    gpu_index = faiss.GpuIndexIVFPQ(
+                        gpu_resources, FEATURE_DIM, nlist, m, NBITS,
+                        metric, config,
+                    )
+                    # Training params live on the GPU index itself, not on
+                    # `index.cp` like the CPU variant.
+                    gpu_index.cp.niter = niter_eff
+                    gpu_index.cp.verbose = True
+                    gpu_index.verbose = True
+                    # Keep the CPU `index` allocated as the safety-net for
+                    # the GPU-OOM fallback path below. It costs ~quantizer
+                    # size in host RAM (negligible vs the train/add tensors)
+                    # and means we don't have to reconstruct on failure.
                 except Exception as e:
-                    print(f"  [GPU] cpu_to_gpu failed ({e}) — falling back to CPU")
+                    print(f"  [GPU] direct GpuIndexIVFPQ construction failed "
+                          f"({type(e).__name__}: {e}) — falling back to CPU")
+                    import traceback
+                    traceback.print_exc()
                     gpu_index = None
         else:
             print("\n[GPU] USE_GPU=1 but no CUDA devices visible — running on CPU")
