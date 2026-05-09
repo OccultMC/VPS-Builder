@@ -867,18 +867,43 @@ def build_faiss_index(features_path: Path, n_vectors: int,
     train_target_eff = TRAIN_SAMPLES  # default; refined in train-cap section
 
     if AUTO_TUNE and INDEX_TYPE == "ivfpq":
-        # Faiss + literature: nlist ≈ 4·√N rounded to nearest power of 2.
-        # Floor at 256 (too few cells = scan-heavy queries), and cap at
-        # n_vectors//39 (faiss requires >=39 training points per cell).
-        target = 4 * _math.sqrt(n_vectors)
-        auto = 2 ** round(_math.log2(max(target, 256)))
+        # ── nlist target: 8·√N (recall-optimised, "overkill") ────────────────
+        # The classic FAISS rule of thumb is 4·√N for balanced build/search.
+        # We bias to 8·√N — finer cells, higher search precision when the
+        # index is queried with a matching nprobe. Constraints:
+        #   * floor at 256 (too few cells = scan-heavy queries)
+        #   * cap by training budget so per-cell train samples stays above
+        #     the FAISS recommended floor (PER_CELL_FLOOR below)
+        #   * cap at n_vectors // 39 (FAISS hard requirement)
+        TRAIN_PER_CELL_TARGET = 1024     # quality knob — more = better k-means convergence
+        TRAIN_PER_CELL_FLOOR  = 64       # FAISS recommends ≥30; we stay safely above
+        # Train cap matches the host-RAM size of the training matrix:
+        # 1.5M × 8448 × 4 bytes ≈ 50 GB, fits a 128 GB host with headroom for
+        # the 200 GB+ features.bin memmap that lives alongside it.
+        TRAIN_HARD_MAX = 1_500_000
+
+        target_nlist = 8 * _math.sqrt(max(n_vectors, 1))
+        auto = 2 ** int(_math.log2(max(target_nlist, 256)))
+        # Cap by FAISS hard requirement (≥39 per cell)
         auto = min(auto, max(256, n_vectors // 39))
+        # Cap by training budget: ensure we can hand FAISS at least
+        # PER_CELL_FLOOR samples per cell without blowing past TRAIN_HARD_MAX
+        train_budget = min(n_vectors, TRAIN_HARD_MAX)
+        max_nlist_by_train = max(256, train_budget // TRAIN_PER_CELL_FLOOR)
+        if auto > max_nlist_by_train:
+            new_auto = 2 ** int(_math.log2(max_nlist_by_train))
+            print(f"  [auto-tune] nlist {auto} -> {new_auto} "
+                  f"(would starve k-means: {train_budget // auto} per cell < "
+                  f"{TRAIN_PER_CELL_FLOOR} floor)")
+            auto = new_auto
         if auto != NLIST:
-            print(f"  [auto-tune] nlist {NLIST} -> {auto} for {n_vectors:,} vectors")
+            print(f"  [auto-tune] nlist {NLIST} -> {auto} for {n_vectors:,} vectors "
+                  f"(target=8·√N={target_nlist:.0f})")
             nlist = auto
-        # niter: 50 is fully converged for IVF k-means at nlist<=32k.
-        # 100 is the historical "safe" default but doubles training time
-        # for ~no recall improvement.
+
+        # ── niter: keep the user's explicit value if reasonable ─────────────
+        # Per user policy this is a fixed setting; only override if someone
+        # sets a wasteful 100+ default that doesn't improve convergence.
         if NITER >= 100:
             niter_eff = 50
             print(f"  [auto-tune] niter {NITER} -> {niter_eff} (sufficient convergence)")
@@ -982,14 +1007,16 @@ def build_faiss_index(features_path: Path, n_vectors: int,
             print("\n[GPU] USE_GPU=1 but no CUDA devices visible — running on CPU")
 
     # Training set sizing.
-    # AUTO_TUNE: target ≈ max(256·nlist, 200K), capped at 2M and N//3.
-    # The 256·nlist target gives faiss enough samples per IVF cell for
-    # well-conditioned k-means (faiss recommends 30-256 per cell).
-    # Then clamped further by GPU VRAM (TRAIN_SAMPLES_GPU) or by the host
-    # RAM ceiling (TRAIN_SAMPLES) depending on where train() will run.
+    # AUTO_TUNE: target = nlist × TRAIN_PER_CELL_TARGET (quality-biased),
+    # capped at TRAIN_HARD_MAX (host-RAM limit) and N (can't sample more
+    # than exist). This pairs with the nlist computation above so per-cell
+    # training stays comfortably above FAISS's PER_CELL_FLOOR.
     if AUTO_TUNE and INDEX_TYPE == "ivfpq":
-        train_target_eff = max(256 * nlist, 200_000)
-        train_target_eff = min(train_target_eff, 2_000_000)
+        train_target_eff = min(
+            nlist * 1024,         # 1024/cell — generous, stable k-means
+            1_500_000,            # ~50 GB host RAM at 8448 dim fp32 (TRAIN_HARD_MAX)
+            n_vectors,            # can't sample more than exist
+        )
     train_cap = TRAIN_SAMPLES_GPU if gpu_requested else TRAIN_SAMPLES
     train_samples = min(n_vectors // 3 or n_vectors, train_target_eff, train_cap)
 
