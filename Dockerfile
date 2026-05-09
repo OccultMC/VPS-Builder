@@ -21,7 +21,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN python -c "import faiss; print(f'faiss {faiss.__version__} import OK')"
 
 # Application code
-COPY pipeline.py r2_storage.py redis_queue.py entrypoint.sh ./
+COPY pipeline.py r2_storage.py redis_queue.py region_attribution.py entrypoint.sh ./
 
 RUN dos2unix entrypoint.sh && chmod +x entrypoint.sh
 

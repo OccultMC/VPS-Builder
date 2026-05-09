@@ -807,12 +807,18 @@ def merge_features_and_metadata(npy_paths: List[Path], jsonl_paths: List[Path],
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def build_faiss_index(features_path: Path, n_vectors: int,
-                      reporter: StatusReporter) -> Path:
+                      reporter: StatusReporter,
+                      r2: "R2Client" = None,
+                      features_prefix: str = None) -> Path:
     """
     Build FAISS IVFPQ index from merged features.
 
     Uses Inner Product metric (MegaLoc vectors are normalized).
     Reads features via direct file I/O to avoid mmap issues on large datasets.
+
+    Optional `r2` + `features_prefix` enable in-build region polygon lookup
+    (downloads Shapefiles/{Country}.geojson from R2 and writes
+    region_polygon_simplified into config.json).
     """
     import faiss
 
@@ -1170,6 +1176,54 @@ def build_faiss_index(features_path: Path, n_vectors: int,
     except Exception as e:
         print(f"  Geo enrichment skipped: {e}")
 
+    # ── Region polygon (downloaded from R2 Shapefiles/, resolved at build) ─────
+    # The features_prefix looks like "Features/{COUNTRY}/{STATE}/{CITY}".
+    # Country dictates which shapefile to grab; the resolver only emits the
+    # simplified polygon (we explicitly skip the full one because it's 30×
+    # larger and unused server-side). Doing this here removes the need to
+    # ever run zelesis-inference/backfill_polygons.py.
+    #
+    # Keys in R2 (uploaded once by the local maintainer):
+    #   AU/* -> Shapefiles/Australia.geojson
+    #   US/* -> Shapefiles/United_States_Urban_By_County.geojson
+    if r2 is None or not features_prefix:
+        # Skip silently when called without R2 context (e.g. legacy code paths).
+        pass
+    try:
+        if r2 is None or not features_prefix:
+            raise RuntimeError("no r2/features_prefix")
+        country = None
+        if isinstance(features_prefix, str):
+            parts = [p for p in features_prefix.strip("/").split("/") if p]
+            if len(parts) >= 2 and parts[0] == "Features":
+                country = parts[1]
+        shape_keys = {
+            "AU": "Shapefiles/Australia.geojson",
+            "US": "Shapefiles/United_States_Urban_By_County.geojson",
+        }
+        shape_key = shape_keys.get(country)
+        if shape_key and config.get("sample_points"):
+            shape_local = WORK_DIR / Path(shape_key).name
+            if not shape_local.exists():
+                print(f"  Downloading shapefile {shape_key}...")
+                r2.download_file(shape_key, str(shape_local))
+            from region_attribution import RegionResolver
+            us_path = str(shape_local) if country == "US" else "/__missing_us__"
+            au_path = str(shape_local) if country == "AU" else "/__missing_au__"
+            resolver = RegionResolver(us_path=us_path, au_path=au_path)
+            pts = [tuple(p) for p in config["sample_points"]]
+            match = resolver.find_union(pts)
+            if match:
+                config.update(match)
+                print(f"  Region polygon: {match['region_name']} "
+                      f"(simplified, source={match['region_source']})")
+            else:
+                print(f"  Region polygon: no match for {country} sample points")
+        else:
+            print(f"  Region polygon skipped (country={country!r})")
+    except Exception as e:
+        print(f"  Region polygon lookup skipped: {e}")
+
     config_path = WORK_DIR / "config.json"
     with open(config_path, 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=2)
@@ -1400,7 +1454,10 @@ def _build_one_city(r2: R2Client, features_prefix: str, city_name: str,
         )
 
         # Step 4: Build FAISS index
-        index_path = build_faiss_index(features_path, total_vectors, reporter)
+        index_path = build_faiss_index(
+            features_path, total_vectors, reporter,
+            r2=r2, features_prefix=features_prefix,
+        )
 
         # Step 5: Upload
         upload_results(r2, features_prefix, reporter)

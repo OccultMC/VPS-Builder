@@ -14,3 +14,9 @@ faiss-gpu-cu12>=1.9.0
 # safetensors retained for any consumer of MegaLoc weights at index time;
 # torch / torchvision / timm come from the pytorch base image.
 safetensors>=0.3.0
+
+# Polygon lookup for the region_polygon_simplified field in config.json.
+# Builder downloads Shapefiles/{Country}.geojson from R2 at build time
+# and resolves the city's admin polygon, so the inference server has it
+# without needing to run the offline backfill.
+shapely>=2.0.0
