@@ -939,6 +939,15 @@ def build_faiss_index(features_path: Path, n_vectors: int,
                     co.useFloat16 = GPU_USE_FLOAT16
                     # IVF lists also benefit from fp16 storage; harmless on PQ.
                     co.useFloat16CoarseQuantizer = GPU_USE_FLOAT16
+                    # Interleaved layout lets faiss-gpu accept arbitrary M
+                    # (sub-quantizer count). Without it, only the standard set
+                    # {1,2,3,4,8,12,16,20,24,28,32,40,48,56,64,96} is allowed
+                    # and any other M (e.g. M=256 for higher recall) silently
+                    # falls back to CPU — which on multi-million-vector indexes
+                    # turns into days of swap-thrashing k-means. Costs ~10-30%
+                    # search latency vs standard layout; trivial vs the build
+                    # time it saves and the recall it preserves.
+                    co.useInterleavedLayout = True
                     gpu_index = faiss.index_cpu_to_gpu(gpu_resources, 0, index, co)
                     # Training/add target follows the GPU index; we keep `index`
                     # bound to the CPU view for the eventual write_index().
