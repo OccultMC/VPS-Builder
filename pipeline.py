@@ -882,12 +882,15 @@ def build_faiss_index(features_path: Path, n_vectors: int,
         # the 200 GB+ features.bin memmap that lives alongside it.
         TRAIN_HARD_MAX = 1_500_000
 
+        # Round to NEAREST power of 2 (not floor) — favours the "overkill"
+        # direction so 8·√1M = 8000 maps to 8192 instead of 4096.
         target_nlist = 8 * _math.sqrt(max(n_vectors, 1))
-        auto = 2 ** int(_math.log2(max(target_nlist, 256)))
+        auto = 2 ** round(_math.log2(max(target_nlist, 256)))
         # Cap by FAISS hard requirement (≥39 per cell)
         auto = min(auto, max(256, n_vectors // 39))
         # Cap by training budget: ensure we can hand FAISS at least
-        # PER_CELL_FLOOR samples per cell without blowing past TRAIN_HARD_MAX
+        # PER_CELL_FLOOR samples per cell without blowing past TRAIN_HARD_MAX.
+        # Use FLOOR (not round) here — must NEVER exceed the floor.
         train_budget = min(n_vectors, TRAIN_HARD_MAX)
         max_nlist_by_train = max(256, train_budget // TRAIN_PER_CELL_FLOOR)
         if auto > max_nlist_by_train:
