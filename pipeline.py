@@ -826,7 +826,26 @@ def build_faiss_index(features_path: Path, n_vectors: int,
     print("STEP 4: Building FAISS index")
     print(f"{'='*80}")
     print(f"Vectors: {n_vectors:,}, Dimension: {FEATURE_DIM}")
-    print(f"Index type: {INDEX_TYPE}, nlist={NLIST}, m={M}, nbits={NBITS}")
+
+    # ── Small-index auto-switch ────────────────────────────────────────────
+    # Below SMALL_INDEX_THRESHOLD vectors, IVFPQ's k-means starves: with
+    # nlist floored at 256, per-cell train samples drop under FAISS's 30
+    # recommendation (e.g. N=13K → 50/cell = sketchy). Pure IndexPQ skips
+    # the IVF clustering entirely and just does PQ-encoded brute force,
+    # which at this scale is FASTER than IVFPQ anyway (no cell-scan
+    # overhead) and avoids the convergence cliff. M=256 sub-quantizers
+    # is preserved so recall quality matches the rest of the fleet.
+    SMALL_INDEX_THRESHOLD = int(os.environ.get("SMALL_INDEX_THRESHOLD", "50000"))
+    AUTO_TUNE_TYPE = os.environ.get("AUTO_TUNE_TYPE", "1") == "1"
+    effective_index_type = INDEX_TYPE
+    if AUTO_TUNE_TYPE and INDEX_TYPE == "ivfpq" and n_vectors < SMALL_INDEX_THRESHOLD:
+        print(f"  [auto-switch] N={n_vectors:,} < {SMALL_INDEX_THRESHOLD:,} "
+              f"— overriding INDEX_TYPE: ivfpq -> pq "
+              f"(IVF k-means would starve at this scale; pure PQ is faster + "
+              f"avoids convergence issues, M={M} preserved)")
+        effective_index_type = "pq"
+
+    print(f"Index type: {effective_index_type}, nlist={NLIST}, m={M}, nbits={NBITS}")
 
     reporter.report("index", "Preparing index", 0)
 
@@ -866,7 +885,7 @@ def build_faiss_index(features_path: Path, n_vectors: int,
     niter_eff = NITER
     train_target_eff = TRAIN_SAMPLES  # default; refined in train-cap section
 
-    if AUTO_TUNE and INDEX_TYPE == "ivfpq":
+    if AUTO_TUNE and effective_index_type == "ivfpq":
         # ── nlist target: 8·√N (recall-optimised, "overkill") ────────────────
         # The classic FAISS rule of thumb is 4·√N for balanced build/search.
         # We bias to 8·√N — finer cells, higher search precision when the
@@ -920,17 +939,17 @@ def build_faiss_index(features_path: Path, n_vectors: int,
     # Create index with Inner Product metric
     metric = faiss.METRIC_INNER_PRODUCT
 
-    if INDEX_TYPE == "ivfpq":
+    if effective_index_type == "ivfpq":
         quantizer = faiss.IndexFlatIP(FEATURE_DIM)
         index = faiss.IndexIVFPQ(quantizer, FEATURE_DIM, nlist, m, NBITS, metric)
         index.cp.niter = niter_eff
         index.cp.verbose = True  # Log clustering progress
         print(f"  Index: IVFPQ, nlist={nlist}, m={m}, nbits={NBITS}, niter={niter_eff}")
-    elif INDEX_TYPE == "pq":
+    elif effective_index_type == "pq":
         index = faiss.IndexPQ(FEATURE_DIM, m, NBITS, metric)
         print(f"  Index: PQ, m={m}, nbits={NBITS}")
     else:
-        raise ValueError(f"Unknown INDEX_TYPE: {INDEX_TYPE}")
+        raise ValueError(f"Unknown effective_index_type: {effective_index_type}")
 
     # Enable FAISS verbose output for training progress
     index.verbose = True
@@ -959,10 +978,11 @@ def build_faiss_index(features_path: Path, n_vectors: int,
             print(f"  [GPU] faiss.get_num_gpus() failed: {e}")
         if n_gpus > 0:
             gpu_requested = True
-            if INDEX_TYPE not in GPU_SUPPORTED_TYPES:
-                print(f"\n[GPU] {n_gpus} CUDA device(s) detected but INDEX_TYPE='{INDEX_TYPE}' "
-                      f"has no faiss-gpu implementation. Running on CPU "
-                      f"(switch INDEX_TYPE to 'ivfpq' to use GPU).")
+            if effective_index_type not in GPU_SUPPORTED_TYPES:
+                print(f"\n[GPU] {n_gpus} CUDA device(s) detected but index type "
+                      f"'{effective_index_type}' has no faiss-gpu implementation. "
+                      f"Running on CPU (only 'ivfpq' is GPU-accelerated; "
+                      f"'pq' is fast enough on CPU at small N).")
             else:
                 print(f"\n[GPU] {n_gpus} CUDA device(s) detected — building index "
                       f"directly on GPU (useFloat16={GPU_USE_FLOAT16})")
@@ -1014,7 +1034,7 @@ def build_faiss_index(features_path: Path, n_vectors: int,
     # capped at TRAIN_HARD_MAX (host-RAM limit) and N (can't sample more
     # than exist). This pairs with the nlist computation above so per-cell
     # training stays comfortably above FAISS's PER_CELL_FLOOR.
-    if AUTO_TUNE and INDEX_TYPE == "ivfpq":
+    if AUTO_TUNE and effective_index_type == "ivfpq":
         train_target_eff = min(
             nlist * 1024,         # 1024/cell — generous, stable k-means
             1_500_000,            # ~50 GB host RAM at 8448 dim fp32 (TRAIN_HARD_MAX)
@@ -1047,10 +1067,10 @@ def build_faiss_index(features_path: Path, n_vectors: int,
     print(f"Training data loaded: {train_data.nbytes / (1024 ** 2):.0f} MB")
     sys.stdout.flush()
 
-    print(f"Training index ({INDEX_TYPE}) — this may take a while...")
+    print(f"Training index ({effective_index_type}) — this may take a while...")
     print(f"  {train_samples:,} vectors x {FEATURE_DIM} dim, {m} sub-quantizers")
     sys.stdout.flush()
-    reporter.report("index", f"Training {INDEX_TYPE} index ({train_samples:,} vectors)", 15)
+    reporter.report("index", f"Training {effective_index_type} index ({train_samples:,} vectors)", 15)
 
     # If GPU clone is set, train on it; the CPU `index` is updated implicitly
     # because faiss's GpuIndex wraps the same parameter buffer (after the
@@ -1152,11 +1172,11 @@ def build_faiss_index(features_path: Path, n_vectors: int,
     config = {
         'n_vectors': n_vectors,
         'dimension': FEATURE_DIM,
-        'index_type': INDEX_TYPE,
+        'index_type': effective_index_type,
         'nlist': nlist,
         'm': m,
         'nbits': NBITS,
-        'niter': niter_eff if INDEX_TYPE == "ivfpq" else None,
+        'niter': niter_eff if effective_index_type == "ivfpq" else None,
         'metric': 'inner_product',
         'train_samples_used': train_samples,
         'train_data_mb': round(train_samples * FEATURE_DIM * 4 / (1024 ** 2)),
