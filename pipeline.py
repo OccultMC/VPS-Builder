@@ -827,23 +827,40 @@ def build_faiss_index(features_path: Path, n_vectors: int,
     print(f"{'='*80}")
     print(f"Vectors: {n_vectors:,}, Dimension: {FEATURE_DIM}")
 
-    # ── Small-index auto-switch ────────────────────────────────────────────
-    # Below SMALL_INDEX_THRESHOLD vectors, IVFPQ adds little over pure PQ
-    # but introduces two failure modes: k-means under-training (per-cell
-    # samples thin out) and search-time recall loss from cell-scan misses.
-    # Pure IndexPQ at this scale gives near-equivalent recall with smaller
-    # build time, no convergence cliff, and the SAME M=256 sub-quantizer
-    # vocabulary as the big indexes (so cross-city recall comparisons
-    # stay valid). On-disk size: ~256 bytes per vector regardless of N.
+    # ── Bidirectional index-type auto-switch ───────────────────────────────
+    # The user's INDEX_TYPE env var (set from the scraper UI dropdown) is
+    # treated as a HINT, not a hard pick. AUTO_TUNE_TYPE=1 (default)
+    # overrides it based on N because the wrong choice has nasty
+    # consequences:
+    #
+    #   * pq for large N → search is brute-force scan of N PQ-encoded
+    #     vectors per query (slow: ~150ms for 500K, ~3s for 9M), no
+    #     nprobe to tune, no GPU acceleration (faiss-gpu doesn't impl
+    #     IndexPQ). Melbourne built this way took 4min on CPU and now
+    #     queries in seconds.
+    #   * ivfpq for small N → IVF k-means starves under FAISS's per-cell
+    #     training floor, codebook quality drops, recall hit.
+    #
+    # Switch policy is therefore symmetric:
+    #   N <  SMALL_INDEX_THRESHOLD → pq    (regardless of input)
+    #   N >= SMALL_INDEX_THRESHOLD → ivfpq (regardless of input)
+    #
+    # AUTO_TUNE_TYPE=0 disables this — the env-var input is honoured
+    # raw, for the rare case someone wants to force a specific type.
     SMALL_INDEX_THRESHOLD = int(os.environ.get("SMALL_INDEX_THRESHOLD", "300000"))
     AUTO_TUNE_TYPE = os.environ.get("AUTO_TUNE_TYPE", "1") == "1"
     effective_index_type = INDEX_TYPE
-    if AUTO_TUNE_TYPE and INDEX_TYPE == "ivfpq" and n_vectors < SMALL_INDEX_THRESHOLD:
-        print(f"  [auto-switch] N={n_vectors:,} < {SMALL_INDEX_THRESHOLD:,} "
-              f"— overriding INDEX_TYPE: ivfpq -> pq "
-              f"(IVF k-means would starve at this scale; pure PQ is faster + "
-              f"avoids convergence issues, M={M} preserved)")
-        effective_index_type = "pq"
+    if AUTO_TUNE_TYPE:
+        target_type = "pq" if n_vectors < SMALL_INDEX_THRESHOLD else "ivfpq"
+        if INDEX_TYPE != target_type:
+            why = (f"N={n_vectors:,} < {SMALL_INDEX_THRESHOLD:,} → pq "
+                   f"(IVF k-means would starve; pure PQ scan is faster at this scale)"
+                   if target_type == "pq"
+                   else f"N={n_vectors:,} >= {SMALL_INDEX_THRESHOLD:,} → ivfpq "
+                   f"(brute-force PQ scan would be slow; IVF cell-skipping wins)")
+            print(f"  [auto-switch] overriding INDEX_TYPE: "
+                  f"{INDEX_TYPE} -> {target_type} ({why}, M={M} preserved)")
+            effective_index_type = target_type
 
     if effective_index_type == "pq":
         print(f"Index type: pq (no IVF cells), m={M}, nbits={NBITS}")
