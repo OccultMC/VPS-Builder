@@ -828,14 +828,14 @@ def build_faiss_index(features_path: Path, n_vectors: int,
     print(f"Vectors: {n_vectors:,}, Dimension: {FEATURE_DIM}")
 
     # ── Small-index auto-switch ────────────────────────────────────────────
-    # Below SMALL_INDEX_THRESHOLD vectors, IVFPQ's k-means starves: with
-    # nlist floored at 256, per-cell train samples drop under FAISS's 30
-    # recommendation (e.g. N=13K → 50/cell = sketchy). Pure IndexPQ skips
-    # the IVF clustering entirely and just does PQ-encoded brute force,
-    # which at this scale is FASTER than IVFPQ anyway (no cell-scan
-    # overhead) and avoids the convergence cliff. M=256 sub-quantizers
-    # is preserved so recall quality matches the rest of the fleet.
-    SMALL_INDEX_THRESHOLD = int(os.environ.get("SMALL_INDEX_THRESHOLD", "50000"))
+    # Below SMALL_INDEX_THRESHOLD vectors, IVFPQ adds little over pure PQ
+    # but introduces two failure modes: k-means under-training (per-cell
+    # samples thin out) and search-time recall loss from cell-scan misses.
+    # Pure IndexPQ at this scale gives near-equivalent recall with smaller
+    # build time, no convergence cliff, and the SAME M=256 sub-quantizer
+    # vocabulary as the big indexes (so cross-city recall comparisons
+    # stay valid). On-disk size: ~256 bytes per vector regardless of N.
+    SMALL_INDEX_THRESHOLD = int(os.environ.get("SMALL_INDEX_THRESHOLD", "300000"))
     AUTO_TUNE_TYPE = os.environ.get("AUTO_TUNE_TYPE", "1") == "1"
     effective_index_type = INDEX_TYPE
     if AUTO_TUNE_TYPE and INDEX_TYPE == "ivfpq" and n_vectors < SMALL_INDEX_THRESHOLD:
