@@ -845,7 +845,10 @@ def build_faiss_index(features_path: Path, n_vectors: int,
               f"avoids convergence issues, M={M} preserved)")
         effective_index_type = "pq"
 
-    print(f"Index type: {effective_index_type}, nlist={NLIST}, m={M}, nbits={NBITS}")
+    if effective_index_type == "pq":
+        print(f"Index type: pq (no IVF cells), m={M}, nbits={NBITS}")
+    else:
+        print(f"Index type: {effective_index_type}, nlist={NLIST}, m={M}, nbits={NBITS}")
 
     reporter.report("index", "Preparing index", 0)
 
@@ -929,12 +932,15 @@ def build_faiss_index(features_path: Path, n_vectors: int,
         if NITER >= 100:
             niter_eff = 50
             print(f"  [auto-tune] niter {NITER} -> {niter_eff} (sufficient convergence)")
-    else:
-        # Legacy fallback: raw env nlist with the old too-large guard
+    elif effective_index_type == "ivfpq":
+        # Legacy fallback (AUTO_TUNE=0): raw env nlist with the old too-large guard
         max_nlist = n_vectors // 39
         if nlist > max_nlist:
             nlist = max(64, 2 ** int(np.log2(max_nlist)))
             print(f"  Auto-adjusted nlist: {NLIST} -> {nlist}")
+    # Note: nlist is meaningless for pure PQ (no IVF cells) — the "Auto-
+    # adjusted nlist 4096 -> 256" output you used to see in PQ mode was a
+    # cosmetic bug that ran the IVFPQ guard against a value never used.
 
     # Create index with Inner Product metric
     metric = faiss.METRIC_INNER_PRODUCT
@@ -1041,7 +1047,21 @@ def build_faiss_index(features_path: Path, n_vectors: int,
             n_vectors,            # can't sample more than exist
         )
     train_cap = TRAIN_SAMPLES_GPU if gpu_requested else TRAIN_SAMPLES
-    train_samples = min(n_vectors // 3 or n_vectors, train_target_eff, train_cap)
+
+    if effective_index_type == "pq":
+        # Pure PQ has no IVF cells — use ALL data for codebook training.
+        # The held-out n//3 sampling was an IVFPQ pattern (training set
+        # vs population separation) that just starves PQ k-means here.
+        # FAISS's PQ k-means recommends K × 39 = 9984 samples (K=256
+        # codes per sub-quantizer × 39/centroid floor). Below that it
+        # warns ~256 × niter times — annoying but non-fatal; recall hit
+        # is the real cost. At ≥10K vectors we satisfy the floor; below,
+        # the warning is unavoidable without dropping to FlatIP.
+        train_samples = min(n_vectors, train_cap)
+    else:
+        # IVFPQ: keep 1/3 reserve so the IVF training and the PQ training
+        # don't fight over the same vectors (FAISS recommendation).
+        train_samples = min(n_vectors // 3 or n_vectors, train_target_eff, train_cap)
 
     if gpu_requested:
         train_bytes_gb = train_samples * FEATURE_DIM * 4 / (1024 ** 3)
