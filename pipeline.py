@@ -1030,10 +1030,52 @@ def build_faiss_index(features_path: Path, n_vectors: int,
                     config.useFloat16LookupTables = GPU_USE_FLOAT16
                     config.interleavedLayout = True
 
-                    gpu_index = faiss.GpuIndexIVFPQ(
-                        gpu_resources, FEATURE_DIM, nlist, m, NBITS,
-                        metric, config,
-                    )
+                    # Two-phase GPU construction:
+                    #   1. Try requested M (e.g. 256 — quality target).
+                    #   2. If verifyPQSettings_ rejects on shared-memory
+                    #      grounds, retry with M=96. faiss-gpu's IVFPQ
+                    #      kernel uses STATIC shared memory (48KB max),
+                    #      not the dynamic shared mem opt-in that
+                    #      Ampere/Ada/Hopper hardware supports — so even
+                    #      a 4090 caps at M*nbits*2 bytes <= 49152, i.e.
+                    #      M <= 96 for nbits=8 + fp16 LUT.
+                    #   3. If even M=96 fails (very old GPU), fall back
+                    #      to CPU with the originally-requested M (slow
+                    #      but preserves quality).
+                    GPU_M_FALLBACK = 96  # largest faiss-gpu standard PQ M
+                    try:
+                        gpu_index = faiss.GpuIndexIVFPQ(
+                            gpu_resources, FEATURE_DIM, nlist, m, NBITS,
+                            metric, config,
+                        )
+                        gpu_m_used = m
+                    except RuntimeError as e:
+                        is_smem = ('shared memory' in str(e).lower()
+                                   or 'requiredsmemsize' in str(e).lower())
+                        if not is_smem or m <= GPU_M_FALLBACK:
+                            raise
+                        print(f"  [GPU] M={m} exceeds faiss-gpu shared-memory "
+                              f"cap (48KB static); retrying with M={GPU_M_FALLBACK} "
+                              f"(largest GPU-supported M for nbits={NBITS} + "
+                              f"fp16 LUT). Recall trade-off: M={m}->M={GPU_M_FALLBACK} "
+                              f"= ~1-3% R@10 hit on MegaLoc features; build is "
+                              f"~10-20x faster than CPU fallback at this scale.")
+                        # FAISS requires M to divide FEATURE_DIM; verify the
+                        # fallback also divides. 8448 % 96 = 0 — safe by design.
+                        if FEATURE_DIM % GPU_M_FALLBACK != 0:
+                            raise RuntimeError(
+                                f"GPU_M_FALLBACK={GPU_M_FALLBACK} doesn't "
+                                f"divide FEATURE_DIM={FEATURE_DIM}; can't "
+                                f"auto-shrink M. Set M env var manually."
+                            ) from e
+                        m = GPU_M_FALLBACK  # rebind so post-build code uses it
+                        gpu_index = faiss.GpuIndexIVFPQ(
+                            gpu_resources, FEATURE_DIM, nlist, m, NBITS,
+                            metric, config,
+                        )
+                        gpu_m_used = m
+                        print(f"  [GPU] M={gpu_m_used} index constructed OK")
+
                     # Training params live on the GPU index itself, not on
                     # `index.cp` like the CPU variant.
                     gpu_index.cp.niter = niter_eff
