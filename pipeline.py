@@ -1030,19 +1030,34 @@ def build_faiss_index(features_path: Path, n_vectors: int,
                     config.useFloat16LookupTables = GPU_USE_FLOAT16
                     config.interleavedLayout = True
 
+                    # cuVS unlocks arbitrary M on GPU (classic faiss-gpu's
+                    # 48KB shared-memory cap blocks M>96). Requires the
+                    # faiss-gpu-cuvs-cu12 package. Opt out via env var if
+                    # ever needed (e.g. cuVS-incompatible GPU), in which
+                    # case we fall through to the classic kernel + M=96
+                    # auto-shrink path below.
+                    USE_CUVS = os.environ.get("FAISS_USE_CUVS", "1") == "1"
+                    if USE_CUVS and hasattr(config, 'use_cuvs'):
+                        config.use_cuvs = True
+                        print(f"  [GPU] cuVS backend enabled (M={m} runs natively)")
+                    elif USE_CUVS:
+                        print(f"  [GPU] FAISS_USE_CUVS=1 but config.use_cuvs "
+                              f"attribute missing — installed faiss-gpu lacks "
+                              f"cuVS support; falling back to classic kernel "
+                              f"(M will be capped at 96)")
+
                     # Two-phase GPU construction:
                     #   1. Try requested M (e.g. 256 — quality target).
+                    #      With cuVS, M=256 works directly. Without cuVS,
+                    #      this trips the 48KB shared-memory cap.
                     #   2. If verifyPQSettings_ rejects on shared-memory
-                    #      grounds, retry with M=96. faiss-gpu's IVFPQ
-                    #      kernel uses STATIC shared memory (48KB max),
-                    #      not the dynamic shared mem opt-in that
-                    #      Ampere/Ada/Hopper hardware supports — so even
-                    #      a 4090 caps at M*nbits*2 bytes <= 49152, i.e.
-                    #      M <= 96 for nbits=8 + fp16 LUT.
+                    #      grounds, retry with M=96 (largest faiss-gpu
+                    #      classic-kernel value that fits in 48KB at
+                    #      nbits=8 + fp16 LUT).
                     #   3. If even M=96 fails (very old GPU), fall back
                     #      to CPU with the originally-requested M (slow
                     #      but preserves quality).
-                    GPU_M_FALLBACK = 96  # largest faiss-gpu standard PQ M
+                    GPU_M_FALLBACK = 96
                     try:
                         gpu_index = faiss.GpuIndexIVFPQ(
                             gpu_resources, FEATURE_DIM, nlist, m, NBITS,
@@ -1054,21 +1069,18 @@ def build_faiss_index(features_path: Path, n_vectors: int,
                                    or 'requiredsmemsize' in str(e).lower())
                         if not is_smem or m <= GPU_M_FALLBACK:
                             raise
-                        print(f"  [GPU] M={m} exceeds faiss-gpu shared-memory "
-                              f"cap (48KB static); retrying with M={GPU_M_FALLBACK} "
-                              f"(largest GPU-supported M for nbits={NBITS} + "
-                              f"fp16 LUT). Recall trade-off: M={m}->M={GPU_M_FALLBACK} "
-                              f"= ~1-3% R@10 hit on MegaLoc features; build is "
-                              f"~10-20x faster than CPU fallback at this scale.")
-                        # FAISS requires M to divide FEATURE_DIM; verify the
-                        # fallback also divides. 8448 % 96 = 0 — safe by design.
+                        print(f"  [GPU] M={m} exceeds classic faiss-gpu "
+                              f"shared-memory cap (48KB static) — cuVS unavailable. "
+                              f"Retrying with M={GPU_M_FALLBACK}. Recall trade-off: "
+                              f"M={m}->M={GPU_M_FALLBACK} = ~1-3% R@10 hit on "
+                              f"MegaLoc features.")
                         if FEATURE_DIM % GPU_M_FALLBACK != 0:
                             raise RuntimeError(
                                 f"GPU_M_FALLBACK={GPU_M_FALLBACK} doesn't "
                                 f"divide FEATURE_DIM={FEATURE_DIM}; can't "
                                 f"auto-shrink M. Set M env var manually."
                             ) from e
-                        m = GPU_M_FALLBACK  # rebind so post-build code uses it
+                        m = GPU_M_FALLBACK
                         gpu_index = faiss.GpuIndexIVFPQ(
                             gpu_resources, FEATURE_DIM, nlist, m, NBITS,
                             metric, config,
