@@ -1046,47 +1046,17 @@ def build_faiss_index(features_path: Path, n_vectors: int,
                               f"cuVS support; falling back to classic kernel "
                               f"(M will be capped at 96)")
 
-                    # Two-phase GPU construction:
-                    #   1. Try requested M (e.g. 256 — quality target).
-                    #      With cuVS, M=256 works directly. Without cuVS,
-                    #      this trips the 48KB shared-memory cap.
-                    #   2. If verifyPQSettings_ rejects on shared-memory
-                    #      grounds, retry with M=96 (largest faiss-gpu
-                    #      classic-kernel value that fits in 48KB at
-                    #      nbits=8 + fp16 LUT).
-                    #   3. If even M=96 fails (very old GPU), fall back
-                    #      to CPU with the originally-requested M (slow
-                    #      but preserves quality).
-                    GPU_M_FALLBACK = 96
-                    try:
-                        gpu_index = faiss.GpuIndexIVFPQ(
-                            gpu_resources, FEATURE_DIM, nlist, m, NBITS,
-                            metric, config,
-                        )
-                        gpu_m_used = m
-                    except RuntimeError as e:
-                        is_smem = ('shared memory' in str(e).lower()
-                                   or 'requiredsmemsize' in str(e).lower())
-                        if not is_smem or m <= GPU_M_FALLBACK:
-                            raise
-                        print(f"  [GPU] M={m} exceeds classic faiss-gpu "
-                              f"shared-memory cap (48KB static) — cuVS unavailable. "
-                              f"Retrying with M={GPU_M_FALLBACK}. Recall trade-off: "
-                              f"M={m}->M={GPU_M_FALLBACK} = ~1-3% R@10 hit on "
-                              f"MegaLoc features.")
-                        if FEATURE_DIM % GPU_M_FALLBACK != 0:
-                            raise RuntimeError(
-                                f"GPU_M_FALLBACK={GPU_M_FALLBACK} doesn't "
-                                f"divide FEATURE_DIM={FEATURE_DIM}; can't "
-                                f"auto-shrink M. Set M env var manually."
-                            ) from e
-                        m = GPU_M_FALLBACK
-                        gpu_index = faiss.GpuIndexIVFPQ(
-                            gpu_resources, FEATURE_DIM, nlist, m, NBITS,
-                            metric, config,
-                        )
-                        gpu_m_used = m
-                        print(f"  [GPU] M={gpu_m_used} index constructed OK")
+                    # Single-phase GPU construction at the user's chosen M.
+                    # User policy: M=256 is quality-critical and not
+                    # negotiable. If GPU can't run at M=256 (cuVS missing,
+                    # too-old GPU, etc), the outer except below catches
+                    # the failure and falls all the way back to CPU at
+                    # the same M=256. We never silently drop M.
+                    gpu_index = faiss.GpuIndexIVFPQ(
+                        gpu_resources, FEATURE_DIM, nlist, m, NBITS,
+                        metric, config,
+                    )
+                    gpu_m_used = m
 
                     # Training params live on the GPU index itself, not on
                     # `index.cp` like the CPU variant.
