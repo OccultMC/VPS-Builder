@@ -847,7 +847,7 @@ def build_faiss_index(features_path: Path, n_vectors: int,
     #
     # AUTO_TUNE_TYPE=0 disables this — the env-var input is honoured
     # raw, for the rare case someone wants to force a specific type.
-    SMALL_INDEX_THRESHOLD = int(os.environ.get("SMALL_INDEX_THRESHOLD", "300000"))
+    SMALL_INDEX_THRESHOLD = int(os.environ.get("SMALL_INDEX_THRESHOLD", "50000"))
     AUTO_TUNE_TYPE = os.environ.get("AUTO_TUNE_TYPE", "1") == "1"
     effective_index_type = INDEX_TYPE
     if AUTO_TUNE_TYPE:
