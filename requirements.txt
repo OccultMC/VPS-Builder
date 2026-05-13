@@ -6,25 +6,18 @@ rich>=14.0.0
 # Redis work queue (Upstash HTTP-based, no TLS client needed)
 upstash-redis>=1.0.0
 
-# FAISS — NVIDIA's CUDA-12 build, cuVS variant.
+# FAISS — installed via conda in the Dockerfile, NOT via pip.
 #
-# cuVS unlocks the classic faiss-gpu IVFPQ M cap (which limited us to
-# {1,2,3,4,8,12,16,20,24,28,32,40,48,56,64,96} regardless of GPU). With
-# cuVS we can run M=256 PQ on GPU directly — no M=96 fallback needed,
-# no CPU-build slowdown for high-recall indexes. Per FAISS wiki:
+# cuVS-enabled faiss-gpu is only published on conda channels (pytorch +
+# nvidia + rapidsai), there's no PyPI wheel for it. The Dockerfile runs
+# `conda install -c pytorch -c nvidia -c rapidsai -c conda-forge
+# faiss-gpu-cuvs` so this requirements.txt deliberately omits faiss.
 #
-#   "The number of subquantizers representing a vector can be any
-#    value less than or equal to the base dimension of the dataset...
-#    GpuIndexIVFPQ indexes with 64 bytes per code or more do not
-#    require the use of the float16 lookup tables for residual
-#    distances."
-#
-# Trade-off: the cuvs build pulls RAFT + cuVS shared libs (~1-2 GB
-# extra layer in the docker image, slower install). Worth it for the
-# 10-20x build speedup on multi-million-vector M=256 IVFPQ indexes.
-# Set FAISS_USE_CUVS=0 in env to fall back to classic kernels at
-# runtime (still needs this package — switch is opt-out, not opt-in).
-faiss-gpu-cuvs-cu12>=1.9.0
+# Why cuVS matters: without it, GpuIndexIVFPQ is limited to M in
+# {1,2,3,4,8,12,16,20,24,28,32,40,48,56,64,96}, so M=256 builds had to
+# either fall to CPU (hours per multi-million-vector city) or get
+# auto-shrunk to M=96 with a ~2% recall hit. cuVS removes the M cap
+# entirely (any M <= FEATURE_DIM) and improves build/search speed.
 
 # safetensors retained for any consumer of MegaLoc weights at index time;
 # torch / torchvision / timm come from the pytorch base image.
